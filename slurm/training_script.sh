@@ -108,6 +108,7 @@ srun --container-image="${CONTAINER_IMAGE}" --container-mounts="${CONTAINER_MOUN
     cd ${WORK_DIR} || { echo 'WORK_DIR ${WORK_DIR} not found in container' >&2; exit 1; }
     unset VLLM_PORT
     # Invoked via bash: the example scripts are not marked executable.
+    pip install datasets
     bash examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh
 " > "logs/dflash_training_${COMMENTS}_${SLURM_JOB_ID}.log" 2>&1 &
 wait
