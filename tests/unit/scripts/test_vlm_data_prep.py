@@ -348,6 +348,55 @@ def test_iter_input_rows_honors_limit_and_skips_bad_lines(tmp_path):
     assert regen.iter_input_rows(path, 2) == [{"a": 1}, {"a": 2}]
 
 
+@pytest.mark.parametrize(
+    ("num_completed", "expected"),
+    [(0, 2), (1, 1), (2, 0)],
+)
+def test_count_remaining_prints_the_count_without_an_endpoint(
+    tmp_path, monkeypatch, capsys, num_completed, expected
+):
+    """--count-remaining must answer from disk alone.
+
+    The pipeline calls this to decide whether starting a server is worth it, so
+    reaching for the endpoint here would defeat the purpose. detect_model is
+    replaced with a raiser to prove it is never consulted.
+    """
+    rows = [
+        {**_exported_row(tmp_path), "conversation_id": f"c{i}"} for i in range(2)
+    ]
+    data = tmp_path / "prompts.jsonl"
+    data.write_text(
+        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
+    )
+    outfile = tmp_path / "conversations.jsonl"
+    outfile.write_text(
+        "".join(json.dumps(rows[i]) + "\n" for i in range(num_completed)),
+        encoding="utf-8",
+    )
+
+    async def _no_endpoint(_endpoint):
+        raise AssertionError("--count-remaining must not contact the endpoint")
+
+    monkeypatch.setattr(regen, "detect_model", _no_endpoint)
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "regenerate_vlm_responses.py",
+            "--data",
+            str(data),
+            "--outfile",
+            str(outfile),
+            "--resume",
+            "--count-remaining",
+        ],
+    )
+
+    asyncio.run(regen.main())
+
+    # stdout carries the bare integer so a shell can capture it directly.
+    assert capsys.readouterr().out.strip() == str(expected)
+
+
 # ---------------------------------------------------------------------------
 # regenerate_vlm_responses.py: the regeneration loop
 # ---------------------------------------------------------------------------

@@ -138,6 +138,16 @@ def parse_args() -> argparse.Namespace:
         help="Append to --outfile, skipping conversations it already contains",
     )
     parser.add_argument(
+        "--count-remaining",
+        action="store_true",
+        help=(
+            "Print the number of conversations still needing regeneration and "
+            "exit, without contacting the endpoint. Lets a pipeline decide "
+            "whether launching a server is worth it; the count comes from the "
+            "same filtering the real run applies, so it cannot drift from it."
+        ),
+    )
+    parser.add_argument(
         "--max-retries",
         type=int,
         default=DEFAULT_MAX_RETRIES,
@@ -480,6 +490,16 @@ def build_work_items(rows: list[dict], completed: set[str]) -> list[dict]:
 
 async def main() -> None:
     args = parse_args()
+
+    # Counting must not need a server: the whole point is to answer the question
+    # before deciding to start one. Everything below this block is ordered so the
+    # count uses the same row loading and filtering as a real run.
+    if args.count_remaining:
+        rows = iter_input_rows(args.data, args.limit)
+        completed = load_completed_ids(args.outfile) if args.resume else set()
+        # stdout carries the number alone; logging goes to stderr.
+        print(len(build_work_items(rows, completed)))
+        return
 
     if args.model is None:
         args.model = await detect_model(args.endpoint)

@@ -137,6 +137,12 @@ IMAGE_DIR="$OUTPUT_DIR/images"
 PROMPTS_FILE="$OUTPUT_DIR/prompts.jsonl"
 CONVERSATIONS_FILE="$OUTPUT_DIR/conversations.jsonl"
 DATA_DIR="$OUTPUT_DIR/prepared"
+# Kept outside DATA_DIR: prepare_data.py --overwrite refuses to run against a
+# directory holding anything it did not write itself.
+PREPARE_STAMP="$OUTPUT_DIR/prepared.stamp"
+# Separate knob so a rerun at a larger scale can train into a clean directory
+# while still reusing the exported prompts, images and regenerated responses.
+CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUTPUT_DIR/checkpoints}"
 
 SERVER_PID=""
 
@@ -149,6 +155,45 @@ cleanup() {
     fi
 }
 trap cleanup EXIT
+
+# What the prepared dataset's contents depend on. prepare_data.py decides whether
+# to skip purely on the presence of *.arrow, so raising MAX_SAMPLES against an
+# existing directory is otherwise ignored in silence and training keeps using the
+# smaller dataset -- along with a token_freq.pt built from it.
+prepare_signature() {
+    local num_conversations=0
+    if [[ -f "$CONVERSATIONS_FILE" ]]; then
+        num_conversations=$(wc -l < "$CONVERSATIONS_FILE" | tr -d '[:space:]')
+    fi
+    echo "max_samples=$MAX_SAMPLES seq_length=$SEQ_LENGTH conversations=$num_conversations"
+}
+
+# The trainer resumes by starting at last_checkpoint_epoch + 1, so once that
+# reaches EPOCHS the epoch loop is an empty range: training does no work, saves
+# nothing, and exits successfully. Refuse to launch into that.
+check_training_would_run() {
+    local last_epoch=-1 name
+    [[ -d "$CHECKPOINT_DIR" ]] || return 0
+
+    for path in "$CHECKPOINT_DIR"/*; do
+        name=$(basename "$path")
+        # Skip checkpoint_best and any non-epoch directory such as 'interrupted'.
+        if [[ -d "$path" && ! -L "$path" && "$name" =~ ^[0-9]+$ ]]; then
+            if (( 10#$name > last_epoch )); then
+                last_epoch=$((10#$name))
+            fi
+        fi
+    done
+
+    (( last_epoch >= 0 )) || return 0
+    if (( last_epoch + 1 >= EPOCHS )); then
+        echo "Checkpoints in $CHECKPOINT_DIR already cover epoch $last_epoch, so" >&2
+        echo "training would resume at epoch $((last_epoch + 1)) with EPOCHS=$EPOCHS" >&2
+        echo "and silently do nothing. Raise EPOCHS, set CHECKPOINT_DIR to a fresh" >&2
+        echo "path, or remove the existing checkpoints." >&2
+        exit 1
+    fi
+}
 
 wait_for_vllm() {
     echo "Waiting for vLLM server to be ready..."
@@ -189,7 +234,11 @@ echo "=== Configuration ==="
 echo "  model=$MODEL export_limit=$EXPORT_LIMIT max_samples=$MAX_SAMPLES"
 echo "  epochs=$EPOCHS lr=$LR seq_length=$SEQ_LENGTH max_turns=$MAX_TURNS"
 echo "  output_dir=$OUTPUT_DIR port=$SERVER_PORT"
+echo "  checkpoint_dir=$CHECKPOINT_DIR checkpoint_freq=$CHECKPOINT_FREQ"
 check_gpus
+# Checked here rather than at step 7 so a run that could not train anything fails
+# now, instead of after the export, regeneration and preprocessing.
+check_training_would_run
 
 mkdir -p "$OUTPUT_DIR"
 
@@ -207,32 +256,47 @@ if [[ -n "$EXPORT_LANGUAGE" ]]; then
 fi
 python3 scripts/export_visionarena.py "${EXPORT_ARGS[@]}"
 
-# Step 2: Launch a plain vLLM server for response regeneration
-echo "=== Step 2: Launching vLLM server for regeneration ==="
-CUDA_VISIBLE_DEVICES="$REGEN_GPUS" vllm serve "$MODEL" \
-    --port "$SERVER_PORT" \
-    --tensor-parallel-size "$REGEN_TP" \
-    --max-model-len "$SEQ_LENGTH" \
-    --allowed-local-media-path "$(realpath "$IMAGE_DIR")" \
-    --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
-    --limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT" &
-SERVER_PID=$!
-wait_for_vllm
-
-# Step 3: Regenerate responses with the target model (this is what makes the
-# data on-policy; the arena's original responses are discarded)
-echo "=== Step 3: Regenerating on-policy responses ==="
-python3 scripts/regenerate_vlm_responses.py \
+# Steps 2-4 only matter if something still needs regenerating. Ask before
+# committing to a model load: on a resubmitted run the answer is usually zero,
+# and step 3 cannot work this out for itself because it reads the served model
+# id off the endpoint before it looks at how much work is left.
+REMAINING=$(python3 scripts/regenerate_vlm_responses.py \
     --data "$PROMPTS_FILE" \
     --outfile "$CONVERSATIONS_FILE" \
-    --endpoint "http://localhost:${SERVER_PORT}/v1/chat/completions" \
-    --concurrency "$REGEN_CONCURRENCY" \
-    --max-tokens "$REGEN_MAX_TOKENS" \
-    --resume
+    --resume \
+    --count-remaining)
+echo "Conversations still needing regeneration: $REMAINING"
 
-# Step 4: Stop the regeneration server before starting the hidden-states one
-echo "=== Step 4: Stopping regeneration server ==="
-cleanup
+if [[ "$REMAINING" -gt 0 ]]; then
+    # Step 2: Launch a plain vLLM server for response regeneration
+    echo "=== Step 2: Launching vLLM server for regeneration ==="
+    CUDA_VISIBLE_DEVICES="$REGEN_GPUS" vllm serve "$MODEL" \
+        --port "$SERVER_PORT" \
+        --tensor-parallel-size "$REGEN_TP" \
+        --max-model-len "$SEQ_LENGTH" \
+        --allowed-local-media-path "$(realpath "$IMAGE_DIR")" \
+        --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
+        --limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT" &
+    SERVER_PID=$!
+    wait_for_vllm
+
+    # Step 3: Regenerate responses with the target model (this is what makes the
+    # data on-policy; the arena's original responses are discarded)
+    echo "=== Step 3: Regenerating on-policy responses ==="
+    python3 scripts/regenerate_vlm_responses.py \
+        --data "$PROMPTS_FILE" \
+        --outfile "$CONVERSATIONS_FILE" \
+        --endpoint "http://localhost:${SERVER_PORT}/v1/chat/completions" \
+        --concurrency "$REGEN_CONCURRENCY" \
+        --max-tokens "$REGEN_MAX_TOKENS" \
+        --resume
+
+    # Step 4: Stop the regeneration server before starting the hidden-states one
+    echo "=== Step 4: Stopping regeneration server ==="
+    cleanup
+else
+    echo "=== Steps 2-4: Skipped, regeneration already complete ==="
+fi
 
 # Step 5: Launch vLLM configured for hidden-state extraction
 echo "=== Step 5: Launching vLLM server for hidden-state extraction ==="
@@ -248,6 +312,28 @@ CUDA_VISIBLE_DEVICES="$EXTRACT_GPUS" python3 scripts/launch_vllm.py "$MODEL" \
 SERVER_PID=$!
 wait_for_vllm
 
+# save_to_disk writes the Arrow shards before the state.json that ties them
+# together, so a run killed inside it leaves shards that are not a loadable
+# dataset. prepare_data.py decides whether to skip by globbing *.arrow alone, so
+# it would treat that wreckage as finished work and step 7 would train on a
+# truncated dataset without complaining. Clear it and let step 6 redo the work.
+if compgen -G "$DATA_DIR/*.arrow" > /dev/null && [[ ! -f "$DATA_DIR/state.json" ]]; then
+    echo "Prepared dataset at $DATA_DIR has shards but no state.json; removing it."
+    rm -rf "$DATA_DIR"
+fi
+
+# Same idea for a dataset that is intact but built from different inputs.
+PREPARE_WANT=$(prepare_signature)
+if [[ -d "$DATA_DIR" ]]; then
+    PREPARE_HAVE=$(cat "$PREPARE_STAMP" 2>/dev/null || true)
+    if [[ "$PREPARE_HAVE" != "$PREPARE_WANT" ]]; then
+        echo "Prepared dataset is stale, rebuilding it."
+        echo "  have: ${PREPARE_HAVE:-<no stamp>}"
+        echo "  want: $PREPARE_WANT"
+        rm -rf "$DATA_DIR"
+    fi
+fi
+
 # Step 6: Preprocess. The render endpoint applies the serving chat template,
 # expands each image into its placeholder tokens, and derives the loss mask from
 # the assistant-turn boundary.
@@ -260,17 +346,21 @@ python3 scripts/prepare_data.py \
     --max-samples "$MAX_SAMPLES" \
     --seq-length "$SEQ_LENGTH"
 
+# Recorded only now, so a preprocessing run that dies leaves no stamp and the
+# next run rebuilds rather than trusting a partial dataset.
+printf '%s\n' "$PREPARE_WANT" > "$PREPARE_STAMP"
+
 # Step 7: Train against the live vLLM server.
-# Checkpoints land in $OUTPUT_DIR/checkpoints/<epoch>/ with a checkpoint_best
-# symlink. Rerunning resumes from the newest one automatically, and a SIGTERM
-# (e.g. a scheduler walltime) saves an `interrupted` checkpoint first -- give
-# the scheduler enough grace time for that write to finish.
+# Checkpoints land in $CHECKPOINT_DIR/<epoch>/ with a checkpoint_best symlink.
+# Rerunning resumes from the newest one automatically, and a SIGTERM (e.g. a
+# scheduler walltime) saves an `interrupted` checkpoint first -- give the
+# scheduler enough grace time for that write to finish.
 echo "=== Step 7: Training ==="
 TRAIN_ARGS=(
     --verifier-name-or-path "$MODEL"
     --data-path "$DATA_DIR"
     --vllm-endpoint "http://localhost:${SERVER_PORT}/v1"
-    --save-path "$OUTPUT_DIR/checkpoints"
+    --save-path "$CHECKPOINT_DIR"
     --draft-vocab-size "$DRAFT_VOCAB_SIZE"
     --epochs "$EPOCHS"
     --lr "$LR"
@@ -295,4 +385,4 @@ CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
     "${TRAIN_ARGS[@]}" \
     --target-layer-ids $TARGET_LAYER_IDS
 
-echo "Done. Checkpoints saved to $OUTPUT_DIR/checkpoints/"
+echo "Done. Checkpoints saved to $CHECKPOINT_DIR/"

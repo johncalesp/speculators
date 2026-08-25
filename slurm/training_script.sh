@@ -47,6 +47,11 @@ export LR="${LR:-3e-4}"
 # epochs, each carrying model weights plus optimizer state.
 export CHECKPOINT_FREQ="${CHECKPOINT_FREQ:-1}"
 export SAVE_BEST="${SAVE_BEST:-}"
+# Defaults to OUTPUT_DIR/checkpoints. Point it somewhere new when scaling a run
+# up: the trainer resumes from whatever is here, and once the saved epochs reach
+# EPOCHS it would train nothing at all. Keeping OUTPUT_DIR unchanged still lets
+# the export and the regeneration reuse what they already produced.
+export CHECKPOINT_DIR="${CHECKPOINT_DIR:-}"
 
 # Regeneration throughput
 export REGEN_CONCURRENCY="${REGEN_CONCURRENCY:-32}"
