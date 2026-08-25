@@ -60,6 +60,13 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Streaming a shuffled dataset issues a request per row group across every
+# shard, and httpx logs each one at INFO. Left alone that buries the export's
+# own progress and writes one line per request -- gigabytes at a 200k limit --
+# each containing a presigned CDN URL carrying the account id and signature.
+for _noisy in ("httpx", "httpcore", "urllib3", "hf_xet", "filelock", "fsspec"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 VISIONARENA_HF_PATH = "lmarena-ai/VisionArena-Chat"
 VISIONARENA_SPLIT = "train"
 

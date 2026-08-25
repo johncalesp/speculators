@@ -65,6 +65,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Keep HTTP-layer chatter out of the log so the per-conversation progress and
+# the failure summary stay readable across a long regeneration run.
+for _noisy in ("httpx", "httpcore", "urllib3", "hf_xet", "filelock", "fsspec"):
+    logging.getLogger(_noisy).setLevel(logging.WARNING)
+
 # Transient statuses worth retrying: request timeout, conflict, too-early, and
 # rate limiting, plus all 5xx. Other non-2xx replies (e.g. 400/401/404) are
 # permanent config or client errors and fail fast.

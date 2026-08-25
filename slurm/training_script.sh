@@ -72,14 +72,21 @@ export LIMIT_MM_PER_PROMPT="${LIMIT_MM_PER_PROMPT:-{\"image\": 4\}}"
 # the allocation is smaller. Align these with whatever this partition grants.
 export REGEN_GPUS="${REGEN_GPUS:-0,1,2,3}"
 export REGEN_TP="${REGEN_TP:-4}"
-export VLLM_GPUS="${VLLM_GPUS:-0,1}"
+export EXTRACT_GPUS="${EXTRACT_GPUS:-0,1}"
 export TRAIN_GPUS="${TRAIN_GPUS:-2,3}"
 export NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-2}"
-export VLLM_DP_SIZE="${VLLM_DP_SIZE:-2}"
+# EXTRACT_DP_SIZE * EXTRACT_TP must equal the EXTRACT_GPUS count. Switch to
+# EXTRACT_DP_SIZE=1 EXTRACT_TP=2 if vLLM refuses data parallelism for this model.
+export EXTRACT_DP_SIZE="${EXTRACT_DP_SIZE:-2}"
+export EXTRACT_TP="${EXTRACT_TP:-1}"
 
-# Named VLLM_HTTP_PORT, not VLLM_PORT: vLLM reads VLLM_PORT from its own
-# environment, so exporting that name would reconfigure the server itself.
-export VLLM_HTTP_PORT="${VLLM_HTTP_PORT:-9090}"
+# None of the names above may begin with VLLM_. vLLM owns that namespace and
+# applies those settings from the environment, so exporting one silently
+# reconfigures every server this pipeline starts. EXTRACT_DP_SIZE was VLLM_DP_SIZE
+# and switched on offline data parallelism for the regeneration server in step 2,
+# which never passes --data-parallel-size at all; vLLM refused to start with
+# "Offline data parallel mode is not supported/useful for dense models".
+export SERVER_PORT="${SERVER_PORT:-9090}"
 
 # Container and paths
 CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fsw/coreai_mlperf_inference/jcalderon/containers/vllm_0.27.1.sqsh}"
@@ -106,9 +113,28 @@ srun --container-image="${CONTAINER_IMAGE}" --container-mounts="${CONTAINER_MOUN
     /bin/bash -c "
     set -uo pipefail
     cd ${WORK_DIR} || { echo 'WORK_DIR ${WORK_DIR} not found in container' >&2; exit 1; }
-    unset VLLM_PORT
+    # Drop any inherited vLLM settings that would override the flags the
+    # pipeline passes explicitly, in case the submitting shell has them set.
+    unset VLLM_PORT VLLM_DP_SIZE
+    # The container ships vLLM's whole stack but not 'datasets', and neither
+    # 'speculators' nor 'hs_connectors' is installed at all. --no-deps on the two
+    # editable installs keeps pip from touching the container's pinned
+    # torch/transformers/vllm. speculators has to be a real install rather than
+    # just PYTHONPATH: config.py reads its own version via importlib.metadata
+    # while the class body executes, so without dist metadata the import raises
+    # PackageNotFoundError. hs_connectors is an unguarded top-level import in
+    # speculators.train.data, so it is required too.
+    pip install 'datasets>=4.0.0,<=5.0.1' || { echo 'datasets install failed' >&2; exit 1; }
+    pip install --no-deps -e ./hs_connectors -e . || {
+        echo 'Editable install failed; needs git plus network for build deps' >&2
+        exit 1
+    }
+    # Fail in seconds rather than after the multi-hour export and regeneration.
+    python -c 'import datasets, hs_connectors, speculators, speculators.train.data' || {
+        echo 'Preflight import check failed' >&2
+        exit 1
+    }
     # Invoked via bash: the example scripts are not marked executable.
-    pip install datasets
     bash examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh
 " > "logs/dflash_training_${COMMENTS}_${SLURM_JOB_ID}.log" 2>&1 &
 wait

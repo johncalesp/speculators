@@ -71,10 +71,14 @@ set -euo pipefail
 #   EXPORT_LIMIT=200000 MAX_SAMPLES=200000 EPOCHS=2 bash examples/train/...sh
 MODEL="${MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}"
 OUTPUT_DIR="${OUTPUT_DIR:-./output/dflash_qwen2_5_vl_7b_visionarena}"
-# Named VLLM_HTTP_PORT rather than VLLM_PORT on purpose: vLLM reads VLLM_PORT
-# from its own environment, so exporting that name would reconfigure the server
-# itself as a side effect.
-VLLM_PORT="${VLLM_HTTP_PORT:-8000}"
+# No variable this script reads may be named VLLM_*. vLLM claims that whole
+# namespace for its own settings and applies them from the environment, so such
+# a name silently reconfigures the server: VLLM_PORT overrides --port, and
+# VLLM_DP_SIZE turns on offline data parallelism, which vLLM then rejects for a
+# dense model with "Offline data parallel mode is not supported/useful". vLLM
+# warns about VLLM_* names it does not recognize but says nothing about the ones
+# it does, so a collision looks like an unrelated config error.
+SERVER_PORT="${SERVER_PORT:-8000}"
 
 EXPORT_LIMIT="${EXPORT_LIMIT:-5000}"        # VisionArena conversations to export
 MAX_SAMPLES="${MAX_SAMPLES:-5000}"          # training rows kept after preprocessing
@@ -119,10 +123,14 @@ LIMIT_MM_PER_PROMPT="${LIMIT_MM_PER_PROMPT:-{\"image\": 4\}}"
 # GPU assignments. Defaults assume 4 visible GPUs.
 REGEN_GPUS="${REGEN_GPUS:-0,1,2,3}"         # no training runs concurrently
 REGEN_TP="${REGEN_TP:-4}"
-VLLM_GPUS="${VLLM_GPUS:-0,1}"               # online training needs separate GPUs
+EXTRACT_GPUS="${EXTRACT_GPUS:-0,1}"         # online training needs separate GPUs
 TRAIN_GPUS="${TRAIN_GPUS:-2,3}"             # for the server and the trainer
 NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-2}"
-VLLM_DP_SIZE="${VLLM_DP_SIZE:-2}"           # must match the VLLM_GPUS count
+# The extraction server splits EXTRACT_GPUS between data and tensor parallelism,
+# so EXTRACT_DP_SIZE * EXTRACT_TP must equal the EXTRACT_GPUS count. If vLLM
+# refuses data parallelism for this model, swap to EXTRACT_DP_SIZE=1 EXTRACT_TP=2.
+EXTRACT_DP_SIZE="${EXTRACT_DP_SIZE:-2}"
+EXTRACT_TP="${EXTRACT_TP:-1}"
 # =======================================
 
 IMAGE_DIR="$OUTPUT_DIR/images"
@@ -130,23 +138,23 @@ PROMPTS_FILE="$OUTPUT_DIR/prompts.jsonl"
 CONVERSATIONS_FILE="$OUTPUT_DIR/conversations.jsonl"
 DATA_DIR="$OUTPUT_DIR/prepared"
 
-VLLM_PID=""
+SERVER_PID=""
 
 cleanup() {
-    if [[ -n "$VLLM_PID" ]]; then
-        echo "Stopping vLLM server (pid $VLLM_PID)..."
-        kill "$VLLM_PID" 2>/dev/null || true
-        wait "$VLLM_PID" 2>/dev/null || true
-        VLLM_PID=""
+    if [[ -n "$SERVER_PID" ]]; then
+        echo "Stopping vLLM server (pid $SERVER_PID)..."
+        kill "$SERVER_PID" 2>/dev/null || true
+        wait "$SERVER_PID" 2>/dev/null || true
+        SERVER_PID=""
     fi
 }
 trap cleanup EXIT
 
 wait_for_vllm() {
     echo "Waiting for vLLM server to be ready..."
-    until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
+    until curl -sf "http://localhost:${SERVER_PORT}/health" > /dev/null 2>&1; do
         # If the server died during startup, stop waiting forever.
-        if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
             echo "vLLM server exited during startup." >&2
             exit 1
         fi
@@ -167,10 +175,10 @@ check_gpus() {
     fi
 
     local needed
-    needed=$(( $(tr ',' ' ' <<< "$VLLM_GPUS" | wc -w) + $(tr ',' ' ' <<< "$TRAIN_GPUS" | wc -w) ))
+    needed=$(( $(tr ',' ' ' <<< "$EXTRACT_GPUS" | wc -w) + $(tr ',' ' ' <<< "$TRAIN_GPUS" | wc -w) ))
     if [[ "$available" -lt "$needed" ]]; then
-        echo "Need $needed GPUs for VLLM_GPUS + TRAIN_GPUS but only $available are visible." >&2
-        echo "Set VLLM_GPUS, TRAIN_GPUS, NUM_TRAIN_GPUS, VLLM_DP_SIZE, REGEN_GPUS and" >&2
+        echo "Need $needed GPUs for EXTRACT_GPUS + TRAIN_GPUS but only $available are visible." >&2
+        echo "Set EXTRACT_GPUS, TRAIN_GPUS, NUM_TRAIN_GPUS, EXTRACT_DP_SIZE, REGEN_GPUS and" >&2
         echo "REGEN_TP to match your allocation." >&2
         exit 1
     fi
@@ -180,7 +188,7 @@ check_gpus() {
 echo "=== Configuration ==="
 echo "  model=$MODEL export_limit=$EXPORT_LIMIT max_samples=$MAX_SAMPLES"
 echo "  epochs=$EPOCHS lr=$LR seq_length=$SEQ_LENGTH max_turns=$MAX_TURNS"
-echo "  output_dir=$OUTPUT_DIR port=$VLLM_PORT"
+echo "  output_dir=$OUTPUT_DIR port=$SERVER_PORT"
 check_gpus
 
 mkdir -p "$OUTPUT_DIR"
@@ -202,13 +210,13 @@ python3 scripts/export_visionarena.py "${EXPORT_ARGS[@]}"
 # Step 2: Launch a plain vLLM server for response regeneration
 echo "=== Step 2: Launching vLLM server for regeneration ==="
 CUDA_VISIBLE_DEVICES="$REGEN_GPUS" vllm serve "$MODEL" \
-    --port "$VLLM_PORT" \
+    --port "$SERVER_PORT" \
     --tensor-parallel-size "$REGEN_TP" \
     --max-model-len "$SEQ_LENGTH" \
     --allowed-local-media-path "$(realpath "$IMAGE_DIR")" \
     --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
     --limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT" &
-VLLM_PID=$!
+SERVER_PID=$!
 wait_for_vllm
 
 # Step 3: Regenerate responses with the target model (this is what makes the
@@ -217,7 +225,7 @@ echo "=== Step 3: Regenerating on-policy responses ==="
 python3 scripts/regenerate_vlm_responses.py \
     --data "$PROMPTS_FILE" \
     --outfile "$CONVERSATIONS_FILE" \
-    --endpoint "http://localhost:${VLLM_PORT}/v1/chat/completions" \
+    --endpoint "http://localhost:${SERVER_PORT}/v1/chat/completions" \
     --concurrency "$REGEN_CONCURRENCY" \
     --max-tokens "$REGEN_MAX_TOKENS" \
     --resume
@@ -228,15 +236,16 @@ cleanup
 
 # Step 5: Launch vLLM configured for hidden-state extraction
 echo "=== Step 5: Launching vLLM server for hidden-state extraction ==="
-CUDA_VISIBLE_DEVICES="$VLLM_GPUS" python scripts/launch_vllm.py "$MODEL" \
+CUDA_VISIBLE_DEVICES="$EXTRACT_GPUS" python scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
-    -- --data-parallel-size "$VLLM_DP_SIZE" \
-       --port "$VLLM_PORT" \
+    -- --data-parallel-size "$EXTRACT_DP_SIZE" \
+       --tensor-parallel-size "$EXTRACT_TP" \
+       --port "$SERVER_PORT" \
        --max-model-len "$SEQ_LENGTH" \
        --allowed-local-media-path "$(realpath "$IMAGE_DIR")" \
        --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
        --limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT" &
-VLLM_PID=$!
+SERVER_PID=$!
 wait_for_vllm
 
 # Step 6: Preprocess. The render endpoint applies the serving chat template,
@@ -247,7 +256,7 @@ python3 scripts/prepare_data.py \
     --model "$MODEL" \
     --data "$CONVERSATIONS_FILE" \
     --output "$DATA_DIR" \
-    --render-endpoint "http://localhost:${VLLM_PORT}" \
+    --render-endpoint "http://localhost:${SERVER_PORT}" \
     --max-samples "$MAX_SAMPLES" \
     --seq-length "$SEQ_LENGTH"
 
@@ -260,7 +269,7 @@ echo "=== Step 7: Training ==="
 TRAIN_ARGS=(
     --verifier-name-or-path "$MODEL"
     --data-path "$DATA_DIR"
-    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1"
+    --vllm-endpoint "http://localhost:${SERVER_PORT}/v1"
     --save-path "$OUTPUT_DIR/checkpoints"
     --draft-vocab-size "$DRAFT_VOCAB_SIZE"
     --epochs "$EPOCHS"
