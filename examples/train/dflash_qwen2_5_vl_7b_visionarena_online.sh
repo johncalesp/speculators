@@ -1,0 +1,289 @@
+#!/bin/bash
+# Online DFlash Training Script -- Vision-Language Target Model
+#
+# Trains a DFlash drafter for Qwen2.5-VL-7B-Instruct on real user vision prompts
+# from lmarena-ai/VisionArena-Chat, with responses regenerated on-policy by the
+# target model itself.
+#
+# Usage: Copy this script, modify the configuration variables below, then run:
+#   bash examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh
+#
+# For a detailed walkthrough of the text-only pipeline, see
+# https://docs.vllm.ai/projects/speculators/en/latest/user_guide/tutorials/train/
+# and for the DFlash recipe rationale, https://github.com/vllm-project/speculators/issues/979
+#
+# ============================================================================
+# Why this script has more steps than the text-only examples
+# ============================================================================
+#
+# 1. VisionArena-Chat's assistant turns come from arena models (GPT-4o, Claude,
+#    and others), not from Qwen2.5-VL. Training on them would teach the drafter
+#    to predict another model's tokens. Steps 1-3 therefore keep only the user
+#    prompts and their images and regenerate the responses with the target
+#    model, which is what makes the data on-policy.
+#
+#    scripts/response_regeneration/ cannot do this: it emits speculator-format
+#    input_ids/loss_mask rows, and prepare_data.py passes those through without
+#    the `messages` column that multimodal hidden-state extraction needs, so the
+#    images would be dropped and the image placeholder tokens embedded as plain
+#    text. regenerate_vlm_responses.py emits conversations instead.
+#
+# 2. Regeneration and hidden-state extraction want different servers. The
+#    hidden-states server writes a safetensors file for every request it serves,
+#    so running multi-token regeneration against it would fill the disk. Step 2
+#    launches a plain server for regeneration; step 5 launches the
+#    hidden-states server for rendering and training.
+#
+# 3. Images are passed to vLLM as file:// URLs, so every server that touches
+#    them needs --allowed-local-media-path. prepare_data.py deliberately
+#    rejects inline and base64 images so preprocessed datasets never copy them.
+#
+# 4. prepare_data.py needs --render-endpoint, so it runs *after* a server is up
+#    rather than as step 1. (The text-only examples in this directory still run
+#    it first and predate that requirement.)
+#
+# ============================================================================
+# Scaling up
+# ============================================================================
+#
+# MAX_SAMPLES below is deliberately a smoke-test value: enough to verify the
+# pipeline end to end and confirm the drafter is learning, not enough for a
+# good model. Every setting reads from the environment, so scaling up needs no
+# edit to this file -- raise EXPORT_LIMIT and MAX_SAMPLES together and lower
+# EPOCHS:
+#
+#   EXPORT_LIMIT=200000 MAX_SAMPLES=200000 EPOCHS=2 \
+#     bash examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh
+#
+# (the dataset has ~199k conversations total)
+#
+# Budget for it: regenerating 200k multi-turn responses is the dominant cost,
+# far more than training. The export streams the dataset, so a small
+# EXPORT_LIMIT only downloads the shards it reaches rather than all ~84GB.
+# Both the export and the regeneration take --resume, so a full-scale run can
+# be stopped and restarted.
+
+set -euo pipefail
+
+# ============ Configuration ============
+# Every value below can be overridden from the environment, so a scheduler
+# script (see slurm/training_script.sh) can set them without editing this file:
+#   EXPORT_LIMIT=200000 MAX_SAMPLES=200000 EPOCHS=2 bash examples/train/...sh
+MODEL="${MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}"
+OUTPUT_DIR="${OUTPUT_DIR:-./output/dflash_qwen2_5_vl_7b_visionarena}"
+# Named VLLM_HTTP_PORT rather than VLLM_PORT on purpose: vLLM reads VLLM_PORT
+# from its own environment, so exporting that name would reconfigure the server
+# itself as a side effect.
+VLLM_PORT="${VLLM_HTTP_PORT:-8000}"
+
+EXPORT_LIMIT="${EXPORT_LIMIT:-5000}"        # VisionArena conversations to export
+MAX_SAMPLES="${MAX_SAMPLES:-5000}"          # training rows kept after preprocessing
+MAX_TURNS="${MAX_TURNS:-2}"                 # cap user turns per conversation
+EXPORT_LANGUAGE="${EXPORT_LANGUAGE:-English}"      # e.g. English; empty keeps all languages
+SEQ_LENGTH="${SEQ_LENGTH:-8192}"
+EPOCHS="${EPOCHS:-5}"
+LR="${LR:-3e-4}"
+
+# Checkpointing. 1 saves at the end of every epoch; values below 1 save within
+# an epoch (0.25 = four times per epoch), which is what you want when a single
+# epoch is long enough that losing one is expensive. Resuming is automatic.
+CHECKPOINT_FREQ="${CHECKPOINT_FREQ:-1}"
+# Set to any non-empty value to keep only the best-validation-loss checkpoint.
+# Off by default, so every epoch is kept and nothing is pruned -- watch the disk.
+SAVE_BEST="${SAVE_BEST:-}"
+
+# Regeneration
+REGEN_CONCURRENCY="${REGEN_CONCURRENCY:-32}"
+REGEN_MAX_TOKENS="${REGEN_MAX_TOKENS:-2048}"
+
+# DFlash-specific parameters (best-practices recipe from RFC #979)
+SPECULATOR_TYPE="${SPECULATOR_TYPE:-dflash}"
+BLOCK_SIZE="${BLOCK_SIZE:-16}"
+MAX_ANCHORS="${MAX_ANCHORS:-3072}"
+NUM_LAYERS="${NUM_LAYERS:-5}"
+PER_POSITION_LOSS_WEIGHT="${PER_POSITION_LOSS_WEIGHT:-dpace}"  # needs --loss-fn ce
+LOSS_FN="${LOSS_FN:-ce}"
+DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
+# Qwen2.5-VL-7B has 28 text layers, so the defaults are [2, 14, 25]; launch_vllm.py
+# appends layer 28. Must match vLLM's eagle_aux_hidden_state_layer_ids.
+TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-2 14 25}"
+
+# Bound how many tokens each image expands to. Qwen2.5-VL's own default
+# (max_pixels=12845056) lets a single large image consume most of the context.
+# Both servers use the same value so responses are generated at the resolution
+# the drafter is later trained on.
+# Braces are escaped so the literal JSON does not close the ${...:-} expansion.
+MM_PROCESSOR_KWARGS="${MM_PROCESSOR_KWARGS:-{\"max_pixels\": 1003520\}}"
+LIMIT_MM_PER_PROMPT="${LIMIT_MM_PER_PROMPT:-{\"image\": 4\}}"
+
+# GPU assignments. Defaults assume 4 visible GPUs.
+REGEN_GPUS="${REGEN_GPUS:-0,1,2,3}"         # no training runs concurrently
+REGEN_TP="${REGEN_TP:-4}"
+VLLM_GPUS="${VLLM_GPUS:-0,1}"               # online training needs separate GPUs
+TRAIN_GPUS="${TRAIN_GPUS:-2,3}"             # for the server and the trainer
+NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-2}"
+VLLM_DP_SIZE="${VLLM_DP_SIZE:-2}"           # must match the VLLM_GPUS count
+# =======================================
+
+IMAGE_DIR="$OUTPUT_DIR/images"
+PROMPTS_FILE="$OUTPUT_DIR/prompts.jsonl"
+CONVERSATIONS_FILE="$OUTPUT_DIR/conversations.jsonl"
+DATA_DIR="$OUTPUT_DIR/prepared"
+
+VLLM_PID=""
+
+cleanup() {
+    if [[ -n "$VLLM_PID" ]]; then
+        echo "Stopping vLLM server (pid $VLLM_PID)..."
+        kill "$VLLM_PID" 2>/dev/null || true
+        wait "$VLLM_PID" 2>/dev/null || true
+        VLLM_PID=""
+    fi
+}
+trap cleanup EXIT
+
+wait_for_vllm() {
+    echo "Waiting for vLLM server to be ready..."
+    until curl -sf "http://localhost:${VLLM_PORT}/health" > /dev/null 2>&1; do
+        # If the server died during startup, stop waiting forever.
+        if ! kill -0 "$VLLM_PID" 2>/dev/null; then
+            echo "vLLM server exited during startup." >&2
+            exit 1
+        fi
+        sleep 5
+    done
+    echo "vLLM server ready."
+}
+
+# Fail now rather than after the export and a model load: the GPU assignments
+# above index into CUDA_VISIBLE_DEVICES, so too small an allocation surfaces as
+# a confusing vLLM error many minutes in.
+check_gpus() {
+    local available
+    available=$(nvidia-smi --list-gpus 2>/dev/null | wc -l)
+    if [[ "$available" -eq 0 ]]; then
+        echo "No GPUs visible; this pipeline needs them for every step after step 1." >&2
+        exit 1
+    fi
+
+    local needed
+    needed=$(( $(tr ',' ' ' <<< "$VLLM_GPUS" | wc -w) + $(tr ',' ' ' <<< "$TRAIN_GPUS" | wc -w) ))
+    if [[ "$available" -lt "$needed" ]]; then
+        echo "Need $needed GPUs for VLLM_GPUS + TRAIN_GPUS but only $available are visible." >&2
+        echo "Set VLLM_GPUS, TRAIN_GPUS, NUM_TRAIN_GPUS, VLLM_DP_SIZE, REGEN_GPUS and" >&2
+        echo "REGEN_TP to match your allocation." >&2
+        exit 1
+    fi
+    echo "$available GPUs visible."
+}
+
+echo "=== Configuration ==="
+echo "  model=$MODEL export_limit=$EXPORT_LIMIT max_samples=$MAX_SAMPLES"
+echo "  epochs=$EPOCHS lr=$LR seq_length=$SEQ_LENGTH max_turns=$MAX_TURNS"
+echo "  output_dir=$OUTPUT_DIR port=$VLLM_PORT"
+check_gpus
+
+mkdir -p "$OUTPUT_DIR"
+
+# Step 1: Export VisionArena prompts and materialize their images (CPU only)
+echo "=== Step 1: Exporting VisionArena prompts and images ==="
+EXPORT_ARGS=(
+    --limit "$EXPORT_LIMIT"
+    --max-turns "$MAX_TURNS"
+    --image-dir "$IMAGE_DIR"
+    --outfile "$PROMPTS_FILE"
+    --resume
+)
+if [[ -n "$EXPORT_LANGUAGE" ]]; then
+    EXPORT_ARGS+=(--language "$EXPORT_LANGUAGE")
+fi
+python scripts/export_visionarena.py "${EXPORT_ARGS[@]}"
+
+# Step 2: Launch a plain vLLM server for response regeneration
+echo "=== Step 2: Launching vLLM server for regeneration ==="
+CUDA_VISIBLE_DEVICES="$REGEN_GPUS" vllm serve "$MODEL" \
+    --port "$VLLM_PORT" \
+    --tensor-parallel-size "$REGEN_TP" \
+    --max-model-len "$SEQ_LENGTH" \
+    --allowed-local-media-path "$(realpath "$IMAGE_DIR")" \
+    --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
+    --limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT" &
+VLLM_PID=$!
+wait_for_vllm
+
+# Step 3: Regenerate responses with the target model (this is what makes the
+# data on-policy; the arena's original responses are discarded)
+echo "=== Step 3: Regenerating on-policy responses ==="
+python scripts/regenerate_vlm_responses.py \
+    --data "$PROMPTS_FILE" \
+    --outfile "$CONVERSATIONS_FILE" \
+    --endpoint "http://localhost:${VLLM_PORT}/v1/chat/completions" \
+    --concurrency "$REGEN_CONCURRENCY" \
+    --max-tokens "$REGEN_MAX_TOKENS" \
+    --resume
+
+# Step 4: Stop the regeneration server before starting the hidden-states one
+echo "=== Step 4: Stopping regeneration server ==="
+cleanup
+
+# Step 5: Launch vLLM configured for hidden-state extraction
+echo "=== Step 5: Launching vLLM server for hidden-state extraction ==="
+CUDA_VISIBLE_DEVICES="$VLLM_GPUS" python scripts/launch_vllm.py "$MODEL" \
+    --target-layer-ids $TARGET_LAYER_IDS \
+    -- --data-parallel-size "$VLLM_DP_SIZE" \
+       --port "$VLLM_PORT" \
+       --max-model-len "$SEQ_LENGTH" \
+       --allowed-local-media-path "$(realpath "$IMAGE_DIR")" \
+       --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
+       --limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT" &
+VLLM_PID=$!
+wait_for_vllm
+
+# Step 6: Preprocess. The render endpoint applies the serving chat template,
+# expands each image into its placeholder tokens, and derives the loss mask from
+# the assistant-turn boundary.
+echo "=== Step 6: Preparing data ==="
+python scripts/prepare_data.py \
+    --model "$MODEL" \
+    --data "$CONVERSATIONS_FILE" \
+    --output "$DATA_DIR" \
+    --render-endpoint "http://localhost:${VLLM_PORT}" \
+    --max-samples "$MAX_SAMPLES" \
+    --seq-length "$SEQ_LENGTH"
+
+# Step 7: Train against the live vLLM server.
+# Checkpoints land in $OUTPUT_DIR/checkpoints/<epoch>/ with a checkpoint_best
+# symlink. Rerunning resumes from the newest one automatically, and a SIGTERM
+# (e.g. a scheduler walltime) saves an `interrupted` checkpoint first -- give
+# the scheduler enough grace time for that write to finish.
+echo "=== Step 7: Training ==="
+TRAIN_ARGS=(
+    --verifier-name-or-path "$MODEL"
+    --data-path "$DATA_DIR"
+    --vllm-endpoint "http://localhost:${VLLM_PORT}/v1"
+    --save-path "$OUTPUT_DIR/checkpoints"
+    --draft-vocab-size "$DRAFT_VOCAB_SIZE"
+    --epochs "$EPOCHS"
+    --lr "$LR"
+    --total-seq-len "$SEQ_LENGTH"
+    --speculator-type "$SPECULATOR_TYPE"
+    --block-size "$BLOCK_SIZE"
+    --max-anchors "$MAX_ANCHORS"
+    --num-layers "$NUM_LAYERS"
+    --per-position-loss-weight "$PER_POSITION_LOSS_WEIGHT"
+    --loss-fn "$LOSS_FN"
+    --checkpoint-freq "$CHECKPOINT_FREQ"
+    --on-missing generate
+    --on-generate delete
+)
+if [[ -n "$SAVE_BEST" ]]; then
+    TRAIN_ARGS+=(--save-best)
+fi
+# TARGET_LAYER_IDS is intentionally unquoted: it is a space-separated list.
+CUDA_VISIBLE_DEVICES="$TRAIN_GPUS" torchrun \
+    --standalone --nproc_per_node "$NUM_TRAIN_GPUS" \
+    scripts/train.py \
+    "${TRAIN_ARGS[@]}" \
+    --target-layer-ids $TARGET_LAYER_IDS
+
+echo "Done. Checkpoints saved to $OUTPUT_DIR/checkpoints/"

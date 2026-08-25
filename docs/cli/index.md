@@ -6,13 +6,15 @@ This page provides a comprehensive reference for all command-line interface (CLI
 
 Speculators provides the following CLI scripts for different stages of the speculative decoding workflow:
 
-| Script                       | Purpose                                                      | Reference                               |
-| ---------------------------- | ------------------------------------------------------------ | --------------------------------------- |
-| `prepare_data.py`            | Preprocess and tokenize datasets for training                | [→ Details](prepare_data.md)            |
-| `data_generation_offline.py` | Generate hidden states offline using vLLM                    | [→ Details](data_generation_offline.md) |
-| `launch_vllm.py`             | Launch vLLM server configured for hidden states extraction   | [→ Details](launch_vllm.md)             |
-| `train.py`                   | Train speculator models with online or offline hidden states | [→ Details](train.md)                   |
-| `response_regeneration/`     | Regenerate dataset responses using a vLLM-served model       | [→ Details](response_regeneration.md)   |
+| Script                        | Purpose                                                      | Reference                               |
+| ----------------------------- | ------------------------------------------------------------ | --------------------------------------- |
+| `prepare_data.py`             | Preprocess and tokenize datasets for training                | [→ Details](prepare_data.md)            |
+| `data_generation_offline.py`  | Generate hidden states offline using vLLM                    | [→ Details](data_generation_offline.md) |
+| `launch_vllm.py`              | Launch vLLM server configured for hidden states extraction   | [→ Details](launch_vllm.md)             |
+| `train.py`                    | Train speculator models with online or offline hidden states | [→ Details](train.md)                   |
+| `response_regeneration/`      | Regenerate dataset responses using a vLLM-served model       | [→ Details](response_regeneration.md)   |
+| `export_visionarena.py`       | Export VisionArena-Chat prompts and images for VLM training  | [→ Details](vlm_data.md)                |
+| `regenerate_vlm_responses.py` | Regenerate multimodal responses on-policy with a target VLM  | [→ Details](vlm_data.md)                |
 
 ## Common Workflows
 
@@ -22,6 +24,12 @@ The diagram below shows the high-level flow for training a speculator model. The
 flowchart TD
     subgraph optional ["Optional: Response Regeneration"]
         A["response_regeneration/script.py\nRegenerate dataset responses for improved model alignment"]
+    end
+
+    subgraph vlm ["Multimodal (VLM) targets"]
+        V1["export_visionarena.py\nExport prompts & write images to disk"]
+        V2["regenerate_vlm_responses.py\nRegenerate responses on-policy with the target VLM"]
+        V1 -- "JSONL prompts + image paths" --> V2
     end
 
     subgraph offline ["Offline Pipeline"]
@@ -39,6 +47,8 @@ flowchart TD
 
     A -- "JSONL conversations" --> B
     A -- "JSONL conversations" --> F
+    V2 -- "JSONL conversations" --> B
+    V2 -- "JSONL conversations" --> F
     B --> C --> D -- "hs_i.safetensors files\ncontaining {hidden_states}" --> E
     F --> G --> H
 
@@ -50,4 +60,6 @@ flowchart TD
     click E "train/" _self
     click A "response_regeneration/" _self
     click H "train/" _self
+    click V1 "vlm_data/" _self
+    click V2 "vlm_data/" _self
 ```

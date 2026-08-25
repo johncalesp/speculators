@@ -100,6 +100,8 @@ Note: if you are using an experiment tracker (e.g. trackio, wandb, tensorboard, 
 
 Speculator training data must contain responses produced by the target model. You can create it with [Response Regeneration](response_regeneration.md) or supply on-policy data from your own generation pipeline.
 
+For a vision-language target, use [Multimodal (VLM) data preparation](../../cli/vlm_data.md) instead. Response Regeneration does not support images, and its speculator-format output cannot carry them.
+
 Response Regeneration writes speculator-format rows containing `input_ids` and `loss_mask`, which `prepare_data.py` can use directly:
 
 ```bash

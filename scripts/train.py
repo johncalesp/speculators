@@ -189,7 +189,11 @@ def create_transformer_layer_config(  # noqa: C901
         max_position_embeddings=verifier_config.max_position_embeddings,
         initializer_range=verifier_config.initializer_range,
         rms_norm_eps=verifier_config.rms_norm_eps,
-        head_dim=head_dim,
+        # Qwen2-family configs (Qwen2.5, Qwen2.5-VL) leave head_dim unset and
+        # derive it from hidden_size // num_attention_heads, which the draft
+        # config classes reject as None. Pass the resolved value -- identical
+        # whenever the verifier does set head_dim.
+        head_dim=resolved_head_dim,
         tie_word_embeddings=False,
         sliding_window=sliding_window,
         use_sliding_window="sliding_attention" in layer_types,
