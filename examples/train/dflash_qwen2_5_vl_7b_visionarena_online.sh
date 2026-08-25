@@ -197,7 +197,7 @@ EXPORT_ARGS=(
 if [[ -n "$EXPORT_LANGUAGE" ]]; then
     EXPORT_ARGS+=(--language "$EXPORT_LANGUAGE")
 fi
-python scripts/export_visionarena.py "${EXPORT_ARGS[@]}"
+python3 scripts/export_visionarena.py "${EXPORT_ARGS[@]}"
 
 # Step 2: Launch a plain vLLM server for response regeneration
 echo "=== Step 2: Launching vLLM server for regeneration ==="
@@ -214,7 +214,7 @@ wait_for_vllm
 # Step 3: Regenerate responses with the target model (this is what makes the
 # data on-policy; the arena's original responses are discarded)
 echo "=== Step 3: Regenerating on-policy responses ==="
-python scripts/regenerate_vlm_responses.py \
+python3 scripts/regenerate_vlm_responses.py \
     --data "$PROMPTS_FILE" \
     --outfile "$CONVERSATIONS_FILE" \
     --endpoint "http://localhost:${VLLM_PORT}/v1/chat/completions" \
@@ -243,7 +243,7 @@ wait_for_vllm
 # expands each image into its placeholder tokens, and derives the loss mask from
 # the assistant-turn boundary.
 echo "=== Step 6: Preparing data ==="
-python scripts/prepare_data.py \
+python3 scripts/prepare_data.py \
     --model "$MODEL" \
     --data "$CONVERSATIONS_FILE" \
     --output "$DATA_DIR" \
