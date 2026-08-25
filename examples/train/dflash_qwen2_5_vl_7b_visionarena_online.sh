@@ -236,7 +236,7 @@ cleanup
 
 # Step 5: Launch vLLM configured for hidden-state extraction
 echo "=== Step 5: Launching vLLM server for hidden-state extraction ==="
-CUDA_VISIBLE_DEVICES="$EXTRACT_GPUS" python scripts/launch_vllm.py "$MODEL" \
+CUDA_VISIBLE_DEVICES="$EXTRACT_GPUS" python3 scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
     -- --data-parallel-size "$EXTRACT_DP_SIZE" \
        --tensor-parallel-size "$EXTRACT_TP" \

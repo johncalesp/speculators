@@ -113,6 +113,13 @@ srun --container-image="${CONTAINER_IMAGE}" --container-mounts="${CONTAINER_MOUN
     /bin/bash -c "
     set -uo pipefail
     cd ${WORK_DIR} || { echo 'WORK_DIR ${WORK_DIR} not found in container' >&2; exit 1; }
+    # Which copies of the two scripts actually ran, and which interpreter. The
+    # work dir is a separate checkout from wherever this file was edited, so a
+    # stale copy otherwise shows up as a baffling downstream error.
+    echo '--- provenance ---'
+    sha1sum slurm/training_script.sh examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh
+    python3 -c 'import sys; print(sys.executable, sys.version.split()[0])'
+    echo '------------------'
     # Drop any inherited vLLM settings that would override the flags the
     # pipeline passes explicitly, in case the submitting shell has them set.
     unset VLLM_PORT VLLM_DP_SIZE
@@ -124,13 +131,16 @@ srun --container-image="${CONTAINER_IMAGE}" --container-mounts="${CONTAINER_MOUN
     # while the class body executes, so without dist metadata the import raises
     # PackageNotFoundError. hs_connectors is an unguarded top-level import in
     # speculators.train.data, so it is required too.
-    pip install 'datasets>=4.0.0,<=5.0.1' || { echo 'datasets install failed' >&2; exit 1; }
-    pip install --no-deps -e ./hs_connectors -e . || {
+    # 'python3 -m pip' rather than bare 'pip' so the install always targets the
+    # interpreter the pipeline runs under, not whichever pip happens to be first
+    # on PATH.
+    python3 -m pip install 'datasets>=4.0.0,<=5.0.1' || { echo 'datasets install failed' >&2; exit 1; }
+    python3 -m pip install --no-deps -e ./hs_connectors -e . || {
         echo 'Editable install failed; needs git plus network for build deps' >&2
         exit 1
     }
     # Fail in seconds rather than after the multi-hour export and regeneration.
-    python -c 'import datasets, hs_connectors, speculators, speculators.train.data' || {
+    python3 -c 'import datasets, hs_connectors, speculators, speculators.train.data' || {
         echo 'Preflight import check failed' >&2
         exit 1
     }
