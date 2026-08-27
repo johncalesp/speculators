@@ -99,6 +99,11 @@ SAVE_BEST="${SAVE_BEST:-}"
 # Regeneration
 REGEN_CONCURRENCY="${REGEN_CONCURRENCY:-32}"
 REGEN_MAX_TOKENS="${REGEN_MAX_TOKENS:-2048}"
+# Set non-empty to skip steps 2-4 outright and train on whatever conversations
+# already exist. Use it to continue an interrupted training run: regenerating a
+# few failed stragglers would change the conversation count, which invalidates
+# the prepared dataset and costs a full re-render of every row.
+SKIP_REGEN="${SKIP_REGEN:-}"
 
 # DFlash-specific parameters (best-practices recipe from RFC #979)
 SPECULATOR_TYPE="${SPECULATOR_TYPE:-dflash}"
@@ -260,12 +265,26 @@ python3 scripts/export_visionarena.py "${EXPORT_ARGS[@]}"
 # committing to a model load: on a resubmitted run the answer is usually zero,
 # and step 3 cannot work this out for itself because it reads the served model
 # id off the endpoint before it looks at how much work is left.
-REMAINING=$(python3 scripts/regenerate_vlm_responses.py \
-    --data "$PROMPTS_FILE" \
-    --outfile "$CONVERSATIONS_FILE" \
-    --resume \
-    --count-remaining)
-echo "Conversations still needing regeneration: $REMAINING"
+if [[ -n "$SKIP_REGEN" ]]; then
+    REMAINING=0
+    echo "SKIP_REGEN set; leaving $CONVERSATIONS_FILE untouched."
+else
+    REMAINING=$(python3 scripts/regenerate_vlm_responses.py \
+        --data "$PROMPTS_FILE" \
+        --outfile "$CONVERSATIONS_FILE" \
+        --resume \
+        --count-remaining)
+    echo "Conversations still needing regeneration: $REMAINING"
+    # Topping up a handful of stragglers is rarely worth what it triggers: the
+    # conversation count changes, which invalidates the prepared dataset and
+    # forces a full re-render of every row to recover a fraction of a percent.
+    # Failures that survived their retries are usually permanent anyway.
+    if (( REMAINING > 0 )) && [[ -f "$PREPARE_STAMP" ]]; then
+        echo "Note: regenerating these will invalidate $DATA_DIR and rebuild it" >&2
+        echo "from scratch. Set SKIP_REGEN=1 to keep the existing data and go" >&2
+        echo "straight to training." >&2
+    fi
+fi
 
 if [[ "$REMAINING" -gt 0 ]]; then
     # Step 2: Launch a plain vLLM server for response regeneration
@@ -324,11 +343,22 @@ fi
 
 # Same idea for a dataset that is intact but built from different inputs.
 PREPARE_WANT=$(prepare_signature)
-if [[ -d "$DATA_DIR" ]]; then
-    PREPARE_HAVE=$(cat "$PREPARE_STAMP" 2>/dev/null || true)
+if [[ -d "$DATA_DIR" ]] && compgen -G "$DATA_DIR/*.arrow" > /dev/null; then
+    if [[ ! -f "$PREPARE_STAMP" ]]; then
+        # A dataset predating the stamp, so its inputs are unknown. Rebuilding on
+        # a guess would throw away hours of rendering; reusing on a guess would
+        # train on the wrong data. Neither is ours to choose silently.
+        echo "Prepared dataset at $DATA_DIR has no stamp, so what it was built" >&2
+        echo "from is unknown. Either rebuild it:" >&2
+        echo "    rm -rf $DATA_DIR" >&2
+        echo "or, if it already matches the settings below, adopt it:" >&2
+        echo "    printf '%s\\n' '$PREPARE_WANT' > $PREPARE_STAMP" >&2
+        exit 1
+    fi
+    PREPARE_HAVE=$(cat "$PREPARE_STAMP")
     if [[ "$PREPARE_HAVE" != "$PREPARE_WANT" ]]; then
         echo "Prepared dataset is stale, rebuilding it."
-        echo "  have: ${PREPARE_HAVE:-<no stamp>}"
+        echo "  have: $PREPARE_HAVE"
         echo "  want: $PREPARE_WANT"
         rm -rf "$DATA_DIR"
     fi

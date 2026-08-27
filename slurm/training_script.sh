@@ -56,6 +56,11 @@ export CHECKPOINT_DIR="${CHECKPOINT_DIR:-}"
 # Regeneration throughput
 export REGEN_CONCURRENCY="${REGEN_CONCURRENCY:-32}"
 export REGEN_MAX_TOKENS="${REGEN_MAX_TOKENS:-2048}"
+# Set non-empty to skip regeneration and train on the conversations already on
+# disk. Worth using to continue an interrupted training run: topping up a few
+# failed conversations changes the conversation count, which invalidates the
+# prepared dataset and costs a full re-render of every row to recover them.
+export SKIP_REGEN="${SKIP_REGEN:-}"
 
 # DFlash recipe (RFC #979 best practices)
 export SPECULATOR_TYPE="${SPECULATOR_TYPE:-dflash}"
