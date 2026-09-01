@@ -4,7 +4,7 @@ Two scripts build on-policy training data for a vision-language target model:
 
 | Script                        | Purpose                                                            |
 | ----------------------------- | ------------------------------------------------------------------ |
-| `export_visionarena.py`       | Stream VisionArena-Chat into prompt-only conversations plus images |
+| `export_visionarena.py`       | Turn a local VisionArena-Chat copy into prompt-only conversations plus images |
 | `regenerate_vlm_responses.py` | Regenerate assistant responses with the target model, on-policy    |
 
 Their output feeds [`prepare_data.py`](prepare_data.md) like any other conversations JSONL. See `examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh` for a full recipe.
@@ -22,6 +22,12 @@ Images are referenced by **path**, never inlined. `prepare_data.py` rejects base
 `lmarena-ai/VisionArena-Chat` pairs ~199k real user vision prompts with responses from arena models (GPT-4o, Claude, and others). Those responses are off-policy for any target model you want to accelerate, so this script keeps the prompts and images and drops the responses.
 
 It also absorbs two dataset quirks: `conversation` nests every turn in a single-element list, and `images` carries encoded bytes inline rather than paths.
+
+The dataset is expected to be downloaded already. Shards are read from disk and nothing is fetched over the network, so the script works on an offline node:
+
+```bash
+hf download lmarena-ai/VisionArena-Chat --repo-type dataset
+```
 
 ```bash
 python scripts/export_visionarena.py \
@@ -41,7 +47,9 @@ Output rows are prompt-only, so they are an intermediate artifact: `prepare_data
 
 **Parameters:**
 
-- `--limit` - target number of conversations in the output file. The dataset is read as a stream, so a small limit downloads only the shards it reaches rather than all ~84GB. With `--resume`, existing rows count toward the limit, so rerunning tops the file up instead of appending a second batch.
+- `--limit` - target number of conversations to use out of the ~199k. Rows are read as a stream, so a small limit touches only the shards it reaches rather than loading all ~84GB. With `--resume`, existing rows count toward the limit, so rerunning tops the file up instead of appending a second batch.
+- `--dataset-path` - directory holding the downloaded dataset: parquet shards (searched recursively) or a `save_to_disk` directory. Defaults to the cached snapshot in the HuggingFace cache (`$HF_HOME`, else `~/.cache/huggingface`). A cache entry holding only `README.md` is rejected rather than treated as an empty dataset.
+- `--allow-download` - stream from the Hub instead, downloading the shards the run reaches. Off by default so a run cannot silently pull tens of GB.
 - `--image-dir` - where image bytes are written. Filenames are content hashes, so reruns and images shared between conversations cost nothing. Pass this directory to vLLM as `--allowed-local-media-path`.
 - `--max-turns` - cap user turns per conversation, which bounds how many generations regeneration needs.
 - `--language` - keep only one language (e.g. `English`).

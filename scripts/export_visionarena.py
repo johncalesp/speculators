@@ -32,14 +32,26 @@ The output is a JSONL file of prompt-only conversations:
 These rows are an intermediate artifact: they have no assistant turns, so
 ``prepare_data.py`` cannot consume them until responses are generated.
 
-The dataset is ~199k rows / ~84GB, so it is read as a stream and ``--limit``
-stops early rather than downloading every shard first.
+The dataset is ~199k rows / ~84GB and is expected to be on disk already. Shards
+are read from a local directory -- by default whichever snapshot the HuggingFace
+cache under ``HF_HOME`` holds -- and nothing is fetched over the network, so a
+run costs no bandwidth and works on an offline node. Pass ``--allow-download``
+to stream from the Hub instead. Rows are read as a stream either way, so
+``--limit`` stops early instead of pulling all 199k rows into memory.
 
 Usage:
+    # read the HuggingFace cache (default)
     python scripts/export_visionarena.py \
         --limit 5000 \
         --image-dir ./output/visionarena/images \
         --outfile ./output/visionarena/prompts.jsonl
+
+    # read a specific directory of shards
+    python scripts/export_visionarena.py \
+        --dataset-path /data/visionarena --limit 5000 ...
+
+To populate the cache first:
+    hf download lmarena-ai/VisionArena-Chat --repo-type dataset
 """
 
 import argparse
@@ -52,7 +64,8 @@ from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
 
-from datasets import load_dataset
+from datasets import Image, load_dataset, load_from_disk
+from huggingface_hub import snapshot_download
 from tqdm import tqdm
 
 logging.basicConfig(
@@ -104,6 +117,26 @@ def parse_args() -> argparse.Namespace:
         help=(
             "Directory to write image files into (default: 'images' next to "
             "--outfile). Serve vLLM with --allowed-local-media-path pointing here."
+        ),
+    )
+    parser.add_argument(
+        "--dataset-path",
+        type=Path,
+        default=None,
+        help=(
+            "Directory holding an already-downloaded copy of the dataset: "
+            "parquet shards (searched recursively), or a save_to_disk "
+            "directory. Default: the cached snapshot in the HuggingFace cache "
+            "($HF_HOME, else ~/.cache/huggingface). Nothing is downloaded."
+        ),
+    )
+    parser.add_argument(
+        "--allow-download",
+        action="store_true",
+        help=(
+            "Stream the dataset from the HuggingFace Hub instead of reading a "
+            "local copy, downloading the shards the run reaches. Off by "
+            "default so a run cannot silently pull tens of GB."
         ),
     )
     parser.add_argument(
@@ -174,6 +207,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--max-turns must be > 0")
     if args.shuffle_buffer_size < 0:
         parser.error("--shuffle-buffer-size must be >= 0")
+    if args.dataset_path is not None and args.allow_download:
+        parser.error("--dataset-path reads a local copy; drop --allow-download")
     if args.image_dir is None:
         args.image_dir = args.outfile.parent / "images"
     return args
@@ -343,13 +378,93 @@ def build_row(
     }
 
 
-def iter_dataset(seed: int, shuffle_buffer_size: int) -> Iterator[dict]:
+def resolve_dataset_dir(dataset_path: Path | None) -> Path:
+    """Locate an already-downloaded copy of the dataset without downloading it.
+
+    An explicit ``dataset_path`` is used as given; otherwise the HuggingFace
+    cache is consulted with ``local_files_only``, which resolves the snapshot
+    directory from what is already on disk.
+    """
+    if dataset_path is not None:
+        if not dataset_path.is_dir():
+            raise FileNotFoundError(
+                f"--dataset-path {dataset_path} is not a directory."
+            )
+        return dataset_path
+
+    try:
+        snapshot = snapshot_download(
+            VISIONARENA_HF_PATH, repo_type="dataset", local_files_only=True
+        )
+    except Exception as exc:
+        raise FileNotFoundError(
+            f"{VISIONARENA_HF_PATH} is not in the HuggingFace cache "
+            f"({os.getenv('HF_HOME') or '~/.cache/huggingface'}). Download it "
+            f"with:\n    hf download {VISIONARENA_HF_PATH} --repo-type dataset\n"
+            "or point --dataset-path at a directory that already holds it."
+        ) from exc
+    return Path(snapshot)
+
+
+def load_local_dataset(dataset_dir: Path):
+    """Open a local copy of the dataset as a stream.
+
+    Two layouts are accepted: parquet shards, which is what the HuggingFace
+    cache and a plain download both hold, and a ``save_to_disk`` directory.
+    Reading a stream rather than the whole table keeps ``--limit`` cheap -- only
+    the shards it reaches are touched, and image bytes never accumulate.
+    """
+    shards = sorted(dataset_dir.rglob("*.parquet"))
+    if shards:
+        logger.info(
+            "Reading %d local parquet shard(s) from %s", len(shards), dataset_dir
+        )
+        dataset = load_dataset(
+            "parquet",
+            data_files=[str(shard) for shard in shards],
+            split="train",
+            streaming=True,
+        )
+    elif (dataset_dir / "state.json").is_file():
+        logger.info("Reading save_to_disk dataset from %s", dataset_dir)
+        dataset = load_from_disk(str(dataset_dir)).to_iterable_dataset()
+    else:
+        raise FileNotFoundError(
+            f"No dataset found under {dataset_dir}: expected *.parquet shards "
+            "(searched recursively) or a save_to_disk directory containing "
+            "state.json. A cache entry holding only README.md means the "
+            f"metadata was fetched but the data was not; run\n"
+            f"    hf download {VISIONARENA_HF_PATH} --repo-type dataset"
+        )
+
+    # write_images() needs the {bytes, path} form. HF defaults Image columns to
+    # decode=True, which yields PIL objects with no bytes to write, and
+    # write_images skips those silently -- an export of prompts with every image
+    # missing. VisionArena declares decode=False and parquet carries that
+    # through, but a re-encoded local copy need not, so pin it either way.
+    images_feature = (dataset.features or {}).get("images")
+    if images_feature is not None:
+        dataset = dataset.cast_column("images", [Image(decode=False)])
+
+    return dataset
+
+
+def iter_dataset(
+    seed: int,
+    shuffle_buffer_size: int,
+    dataset_dir: Path | None,
+) -> Iterator[dict]:
     """Stream VisionArena-Chat, optionally shuffling within a reservoir.
 
-    Streaming keeps the ~84GB of image shards from being downloaded up front;
-    only the shards a run actually reaches are fetched.
+    ``dataset_dir`` reads an already-downloaded copy; ``None`` streams from the
+    Hub, downloading the shards the run reaches.
     """
-    dataset = load_dataset(VISIONARENA_HF_PATH, split=VISIONARENA_SPLIT, streaming=True)
+    if dataset_dir is not None:
+        dataset = load_local_dataset(dataset_dir)
+    else:
+        dataset = load_dataset(
+            VISIONARENA_HF_PATH, split=VISIONARENA_SPLIT, streaming=True
+        )
     if shuffle_buffer_size:
         # Shards are ordered by upload time, so an unshuffled prefix is skewed
         # toward whichever models and prompt styles were live then. This also
@@ -362,6 +477,10 @@ def iter_dataset(seed: int, shuffle_buffer_size: int) -> Iterator[dict]:
 def main() -> None:
     args = parse_args()
 
+    dataset_dir = (
+        None if args.allow_download else resolve_dataset_dir(args.dataset_path)
+    )
+
     args.image_dir.mkdir(parents=True, exist_ok=True)
     args.outfile.parent.mkdir(parents=True, exist_ok=True)
 
@@ -371,7 +490,16 @@ def main() -> None:
             "Resuming: %d conversations already in %s", len(exported_ids), args.outfile
         )
 
-    logger.info("Streaming %s (split %s)", VISIONARENA_HF_PATH, VISIONARENA_SPLIT)
+    if dataset_dir is None:
+        logger.info(
+            "Streaming %s (split %s) from the Hub",
+            VISIONARENA_HF_PATH,
+            VISIONARENA_SPLIT,
+        )
+    else:
+        logger.info(
+            "Reading local copy of %s from %s", VISIONARENA_HF_PATH, dataset_dir
+        )
     logger.info("Writing images to %s", args.image_dir.resolve())
     logger.info(
         "Serve vLLM with --allowed-local-media-path %s so it can read them",
@@ -390,13 +518,18 @@ def main() -> None:
         )
         return
 
+    # Opened before the output file: without --resume that open truncates, and
+    # a missing or unreadable local copy must not cost a previous export. The
+    # stream is lazy, so this only validates the shards and schema.
+    rows = iter_dataset(args.seed, args.shuffle_buffer_size, dataset_dir)
+
     with (
         args.outfile.open("a" if args.resume else "w", encoding="utf-8") as handle,
         tqdm(
             total=args.limit, initial=num_existing, desc="Exporting", unit="conv"
         ) as progress,
     ):
-        for row in iter_dataset(args.seed, args.shuffle_buffer_size):
+        for row in rows:
             if args.limit is not None and num_existing + num_exported >= args.limit:
                 break
             if args.language is not None and row.get("language") != args.language:

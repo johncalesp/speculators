@@ -58,8 +58,9 @@
 # (the dataset has ~199k conversations total)
 #
 # Budget for it: regenerating 200k multi-turn responses is the dominant cost,
-# far more than training. The export streams the dataset, so a small
-# EXPORT_LIMIT only downloads the shards it reaches rather than all ~84GB.
+# far more than training. Step 1 expects the dataset to be downloaded already
+# and reads it from disk, so raising EXPORT_LIMIT costs no bandwidth -- but the
+# images it materializes do cost disk, roughly 0.4GB per 1000 conversations.
 # Both the export and the regeneration take --resume, so a full-scale run can
 # be stopped and restarted.
 
@@ -82,6 +83,13 @@ SERVER_PORT="${SERVER_PORT:-8000}"
 
 EXPORT_LIMIT="${EXPORT_LIMIT:-5000}"        # VisionArena conversations to export
 MAX_SAMPLES="${MAX_SAMPLES:-5000}"          # training rows kept after preprocessing
+# Step 1 reads an already-downloaded dataset and never hits the network. Leave
+# this empty to use the HuggingFace cache ($HF_HOME, else ~/.cache/huggingface),
+# or point it at a directory holding the parquet shards. Populate the cache with
+#   hf download lmarena-ai/VisionArena-Chat --repo-type dataset
+# Set EXPORT_ALLOW_DOWNLOAD non-empty to stream from the Hub instead.
+DATASET_PATH="${DATASET_PATH:-}"
+EXPORT_ALLOW_DOWNLOAD="${EXPORT_ALLOW_DOWNLOAD:-}"
 MAX_TURNS="${MAX_TURNS:-2}"                 # cap user turns per conversation
 EXPORT_LANGUAGE="${EXPORT_LANGUAGE:-English}"      # e.g. English; empty keeps all languages
 SEQ_LENGTH="${SEQ_LENGTH:-8192}"
@@ -239,6 +247,11 @@ echo "=== Configuration ==="
 echo "  model=$MODEL export_limit=$EXPORT_LIMIT max_samples=$MAX_SAMPLES"
 echo "  epochs=$EPOCHS lr=$LR seq_length=$SEQ_LENGTH max_turns=$MAX_TURNS"
 echo "  output_dir=$OUTPUT_DIR port=$SERVER_PORT"
+if [[ -n "$EXPORT_ALLOW_DOWNLOAD" ]]; then
+    echo "  dataset=streaming from the Hub (downloads shards)"
+else
+    echo "  dataset=${DATASET_PATH:-HuggingFace cache (${HF_HOME:-~/.cache/huggingface})}"
+fi
 echo "  checkpoint_dir=$CHECKPOINT_DIR checkpoint_freq=$CHECKPOINT_FREQ"
 check_gpus
 # Checked here rather than at step 7 so a run that could not train anything fails
@@ -248,6 +261,9 @@ check_training_would_run
 mkdir -p "$OUTPUT_DIR"
 
 # Step 1: Export VisionArena prompts and materialize their images (CPU only)
+# Reads the local copy of the dataset -- the HuggingFace cache by default, or
+# DATASET_PATH -- so this step needs no network. --limit caps how many of the
+# ~199k conversations are used; only the shards it reaches are read.
 echo "=== Step 1: Exporting VisionArena prompts and images ==="
 EXPORT_ARGS=(
     --limit "$EXPORT_LIMIT"
@@ -258,6 +274,11 @@ EXPORT_ARGS=(
 )
 if [[ -n "$EXPORT_LANGUAGE" ]]; then
     EXPORT_ARGS+=(--language "$EXPORT_LANGUAGE")
+fi
+if [[ -n "$EXPORT_ALLOW_DOWNLOAD" ]]; then
+    EXPORT_ARGS+=(--allow-download)
+elif [[ -n "$DATASET_PATH" ]]; then
+    EXPORT_ARGS+=(--dataset-path "$DATASET_PATH")
 fi
 python3 scripts/export_visionarena.py "${EXPORT_ARGS[@]}"
 

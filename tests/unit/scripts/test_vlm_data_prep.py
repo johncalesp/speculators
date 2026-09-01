@@ -17,10 +17,13 @@ The scripts are not packages, so they are imported by path.
 import asyncio
 import importlib.util
 import json
+import struct
+import zlib
 from pathlib import Path
 from typing import Any
 
 import pytest
+from datasets import Dataset, Features, Image, Value
 
 from speculators.data_generation.preprocessing import _adapt_conv_for_vllm
 
@@ -265,6 +268,94 @@ def test_load_exported_ids_ignores_malformed_lines(tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# export_visionarena.py: reading an already-downloaded copy
+# ---------------------------------------------------------------------------
+
+
+def _write_local_copy(directory: Path, *, decode: bool) -> None:
+    """Write a one-row parquet copy with VisionArena's schema.
+
+    ``decode`` picks how the images column is declared, which is what decides
+    whether rows arrive as ``{bytes, path}`` dicts or as PIL objects.
+    """
+    features = Features(
+        {
+            "images": [Image(decode=decode)],
+            "conversation_id": Value("string"),
+            "conversation": [[{"content": Value("string"), "role": Value("string")}]],
+            "language": Value("string"),
+        }
+    )
+
+    # A real PNG: a decode=True column has to be decodable by PIL to load.
+    def _chunk(tag: bytes, data: bytes) -> bytes:
+        body = tag + data
+        return struct.pack(">I", len(data)) + body + struct.pack(">I", zlib.crc32(body))
+
+    png = (
+        b"\x89PNG\r\n\x1a\n"
+        + _chunk(b"IHDR", struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0))
+        + _chunk(b"IDAT", zlib.compress(b"\x00\x01\x02\x03"))
+        + _chunk(b"IEND", b"")
+    )
+    directory.mkdir(parents=True, exist_ok=True)
+    Dataset.from_dict(
+        {
+            "images": [[{"bytes": png, "path": "abc.png"}]],
+            "conversation_id": ["c0"],
+            "conversation": [[[{"content": "What's this?", "role": "user"}]]],
+            "language": ["English"],
+        },
+        features=features,
+    ).to_parquet(directory / "train-00000-of-00001.parquet")
+
+
+@pytest.mark.parametrize("decode", [False, True])
+def test_load_local_dataset_always_yields_writable_image_bytes(tmp_path, decode):
+    """Images must survive either way the column can be declared.
+
+    HF defaults Image columns to ``decode=True``, which yields PIL objects that
+    ``write_images`` has no bytes to write and skips silently -- an export of
+    prompts with every image missing. The loader pins ``decode=False`` so a
+    re-encoded local copy cannot cause that.
+    """
+    _write_local_copy(tmp_path / "copy", decode=decode)
+
+    row = next(iter(export.load_local_dataset(tmp_path / "copy")))
+    assert isinstance(row["images"][0], dict)
+
+    image_dir = tmp_path / "images"
+    image_dir.mkdir()
+    written = export.write_images(row["images"], image_dir)
+    assert len(written) == 1
+    assert written[0].is_file()
+
+
+def test_load_local_dataset_finds_shards_in_nested_directories(tmp_path):
+    """The HF cache nests shards under the snapshot, e.g. ``snapshots/<rev>/data``."""
+    _write_local_copy(tmp_path / "snapshots" / "deadbeef" / "data", decode=False)
+
+    assert next(iter(export.load_local_dataset(tmp_path)))["conversation_id"] == "c0"
+
+
+def test_load_local_dataset_rejects_a_directory_with_no_data(tmp_path):
+    """A cache entry holding only README.md must not look like a usable copy."""
+    (tmp_path / "README.md").write_text("card only", encoding="utf-8")
+
+    with pytest.raises(FileNotFoundError, match="No dataset found"):
+        export.load_local_dataset(tmp_path)
+
+
+def test_resolve_dataset_dir_rejects_a_missing_explicit_path(tmp_path):
+    with pytest.raises(FileNotFoundError, match="is not a directory"):
+        export.resolve_dataset_dir(tmp_path / "absent")
+
+
+def test_resolve_dataset_dir_uses_an_explicit_path_verbatim(tmp_path):
+    assert export.resolve_dataset_dir(tmp_path) == tmp_path
+
+
+# ---------------------------------------------------------------------------
 # regenerate_vlm_responses.py: input handling
 # ---------------------------------------------------------------------------
 
@@ -361,13 +452,9 @@ def test_count_remaining_prints_the_count_without_an_endpoint(
     reaching for the endpoint here would defeat the purpose. detect_model is
     replaced with a raiser to prove it is never consulted.
     """
-    rows = [
-        {**_exported_row(tmp_path), "conversation_id": f"c{i}"} for i in range(2)
-    ]
+    rows = [{**_exported_row(tmp_path), "conversation_id": f"c{i}"} for i in range(2)]
     data = tmp_path / "prompts.jsonl"
-    data.write_text(
-        "".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8"
-    )
+    data.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
     outfile = tmp_path / "conversations.jsonl"
     outfile.write_text(
         "".join(json.dumps(rows[i]) + "\n" for i in range(num_completed)),
