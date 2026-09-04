@@ -320,6 +320,31 @@ wait_for_vllm() {
 # Fail now rather than after the export and a model load: the GPU assignments
 # above index into CUDA_VISIBLE_DEVICES, so too small an allocation surfaces as
 # a confusing vLLM error many minutes in.
+# Create OUTPUT_DIR now rather than after the preflight, and say how much room
+# its filesystem has. Everything the run produces lands here -- for nemotron the
+# images alone are 387 GB at vqa_1 --fraction 1 -- and the old ordering only
+# found an unwritable or full path after the GPU checks had passed, or worse,
+# part-way through an hour of downloading.
+check_output_dir() {
+    if ! mkdir -p "$OUTPUT_DIR" 2>/dev/null; then
+        echo "Cannot create OUTPUT_DIR=$OUTPUT_DIR" >&2
+        echo "Set OUTPUT_DIR to a writable path on a filesystem with room for the" >&2
+        echo "images, the prepared dataset and the checkpoints. 'df -h' lists the" >&2
+        echo "candidates and their free space." >&2
+        exit 1
+    fi
+    if ! [[ -w "$OUTPUT_DIR" ]]; then
+        echo "OUTPUT_DIR=$OUTPUT_DIR exists but is not writable." >&2
+        exit 1
+    fi
+
+    local avail_kb
+    avail_kb=$(df -Pk "$OUTPUT_DIR" 2>/dev/null | awk 'NR==2 {print $4}')
+    if [[ -n "$avail_kb" ]]; then
+        echo "  output_dir has $(( avail_kb / 1024 / 1024 )) GB free"
+    fi
+}
+
 check_gpus() {
     local available
     available=$(nvidia-smi --list-gpus 2>/dev/null | wc -l)
@@ -401,12 +426,11 @@ else
     echo "  source=${DATASET_PATH:-HuggingFace cache (${HF_HOME:-~/.cache/huggingface})}"
 fi
 echo "  checkpoint_dir=$CHECKPOINT_DIR checkpoint_freq=$CHECKPOINT_FREQ"
+check_output_dir
 check_gpus
 # Checked here rather than at step 7 so a run that could not train anything fails
 # now, instead of after the export, regeneration and preprocessing.
 check_training_would_run
-
-mkdir -p "$OUTPUT_DIR"
 
 # Step 0: Fetch images for nemotron partitions that ship without them.
 # Only the OpenImages-backed partitions can be fetched; the others are rejected
