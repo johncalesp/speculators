@@ -66,6 +66,14 @@
 
 set -euo pipefail
 
+# vLLM reads these from the environment and they override the flags this script
+# passes, so a value left over in the calling shell silently reconfigures the
+# servers below. VLLM_DP_SIZE is the dangerous one: it enables offline data
+# parallelism, which vLLM then rejects for a dense model with an error that
+# names neither the variable nor the environment. Cleared here rather than only
+# in slurm/training_script.sh, so running this script directly is just as safe.
+unset VLLM_PORT VLLM_DP_SIZE
+
 # ============ Configuration ============
 # Every value below can be overridden from the environment, so a scheduler
 # script (see slurm/training_script.sh) can set them without editing this file:
@@ -81,17 +89,63 @@ OUTPUT_DIR="${OUTPUT_DIR:-./output/dflash_qwen2_5_vl_7b_visionarena}"
 # it does, so a collision looks like an unrelated config error.
 SERVER_PORT="${SERVER_PORT:-8000}"
 
-EXPORT_LIMIT="${EXPORT_LIMIT:-5000}"        # VisionArena conversations to export
-MAX_SAMPLES="${MAX_SAMPLES:-5000}"          # training rows kept after preprocessing
+# Which source dataset step 1 exports from. Steps 2-7 are identical either way,
+# since both exports emit the same prompt-only conversations.
+#   visionarena - lmarena-ai/VisionArena-Chat, real multi-turn user chat prompts
+#   nemotron    - nvidia/Llama-Nemotron-VLM-Dataset-v1, single-turn OCR/VQA over
+#                 documents and charts, selected by partition
+DATASET="${DATASET:-visionarena}"
+
 # Step 1 reads an already-downloaded dataset and never hits the network. Leave
 # this empty to use the HuggingFace cache ($HF_HOME, else ~/.cache/huggingface),
-# or point it at a directory holding the parquet shards. Populate the cache with
+# or point it at the directory holding the dataset. Populate the cache with
 #   hf download lmarena-ai/VisionArena-Chat --repo-type dataset
-# Set EXPORT_ALLOW_DOWNLOAD non-empty to stream from the Hub instead.
+#   hf download nvidia/Llama-Nemotron-VLM-Dataset-v1 --repo-type dataset
 DATASET_PATH="${DATASET_PATH:-}"
-EXPORT_ALLOW_DOWNLOAD="${EXPORT_ALLOW_DOWNLOAD:-}"
+
+# --- visionarena only ---
+EXPORT_LIMIT="${EXPORT_LIMIT:-5000}"        # conversations to export
 MAX_TURNS="${MAX_TURNS:-2}"                 # cap user turns per conversation
-EXPORT_LANGUAGE="${EXPORT_LANGUAGE:-English}"      # e.g. English; empty keeps all languages
+# ${VAR-default} rather than ${VAR:-default}: only about half the dataset is
+# English, so EXPORT_LANGUAGE= has to be able to mean "keep every language".
+# With the colon form an empty value would fall back to English instead, and the
+# other half would stay unreachable.
+EXPORT_LANGUAGE="${EXPORT_LANGUAGE-English}"       # e.g. English; empty keeps all languages
+# Set EXPORT_ALLOW_DOWNLOAD non-empty to stream from the Hub instead of reading
+# a local copy. Only visionarena can stream; nemotron images come from TAR
+# shards that have to be on disk.
+EXPORT_ALLOW_DOWNLOAD="${EXPORT_ALLOW_DOWNLOAD:-}"
+
+# --- nemotron only ---
+# Comma-separated partitions, e.g. ocr_1,ocr_4,vqa_9. Empty uses every partition
+# whose images are present in the local copy. Note that the repo ships all 21
+# partitions' JSONL but only some partitions' images -- run
+#   python3 scripts/export_nemotron_vlm.py --list-partitions
+# to see which are usable before picking.
+NEMOTRON_PARTITIONS="${NEMOTRON_PARTITIONS:-}"
+# Fraction of each partition to keep: 1 = 100%, 0.5 = 50%, 0.01 = 1%. Selection
+# is nested, so raising this later keeps every row already exported and adds to
+# it rather than resampling a different subset and re-extracting its images.
+EXPORT_FRACTION="${EXPORT_FRACTION:-0.01}"
+# Partitions whose images are not shipped but can be fetched from OpenImages
+# (captioning_1, captioning_2, vqa_1, vqa_2, vqa_3) are downloaded in step 0.
+# The download uses the same EXPORT_FRACTION and seed as the export, so only the
+# images the export will actually ask for are fetched -- at fraction 1 vqa_1
+# alone is 378 GB, so this matters. Set NEMOTRON_SKIP_DOWNLOAD non-empty to
+# require the images be present already and fail instead of fetching them.
+NEMOTRON_SKIP_DOWNLOAD="${NEMOTRON_SKIP_DOWNLOAD:-}"
+# Simultaneous image requests during that download.
+NEMOTRON_DOWNLOAD_CONCURRENCY="${NEMOTRON_DOWNLOAD_CONCURRENCY:-64}"
+# Sampling seed. Shared by the download and the export so the two agree on
+# which rows are in play; changing it selects a different subset of the same
+# size and orphans the images already fetched.
+EXPORT_SEED="${EXPORT_SEED:-0}"
+
+# Cap on training rows kept after preprocessing. Leave empty to keep everything
+# the export produced, which is what you want when EXPORT_FRACTION is already
+# the size knob -- hence ${VAR-default}, so an empty value survives instead of
+# falling back to the default.
+MAX_SAMPLES="${MAX_SAMPLES-5000}"
 SEQ_LENGTH="${SEQ_LENGTH:-8192}"
 EPOCHS="${EPOCHS:-5}"
 LR="${LR:-3e-4}"
@@ -135,6 +189,12 @@ LIMIT_MM_PER_PROMPT="${LIMIT_MM_PER_PROMPT:-{\"image\": 4\}}"
 
 # GPU assignments. Defaults assume 4 visible GPUs.
 REGEN_GPUS="${REGEN_GPUS:-0,1,2,3}"         # no training runs concurrently
+# Regeneration splits REGEN_GPUS the same way the extraction server does, so
+# REGEN_DP * REGEN_TP must equal the REGEN_GPUS count. Tensor parallelism is
+# bounded by the model: REGEN_TP has to divide the target's attention-head count
+# (28 for Qwen2.5-VL-7B, so 1, 2 or 4 -- not 8). Past that bound, add replicas
+# with REGEN_DP instead, or the extra GPUs sit idle through the longest step.
+REGEN_DP="${REGEN_DP:-1}"
 REGEN_TP="${REGEN_TP:-4}"
 EXTRACT_GPUS="${EXTRACT_GPUS:-0,1}"         # online training needs separate GPUs
 TRAIN_GPUS="${TRAIN_GPUS:-2,3}"             # for the server and the trainer
@@ -169,16 +229,52 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# Only the two exports exist, and an unrecognized name would otherwise leave
+# EXPORT_SCRIPT unset and fail inside step 1 as an unbound-variable error.
+check_dataset_config() {
+    case "$DATASET" in
+        visionarena) ;;
+        nemotron)
+            if [[ -n "$EXPORT_ALLOW_DOWNLOAD" ]]; then
+                echo "EXPORT_ALLOW_DOWNLOAD does not apply to DATASET=nemotron:" >&2
+                echo "its images come from TAR shards that must already be on" >&2
+                echo "disk. Download the dataset first:" >&2
+                echo "    hf download nvidia/Llama-Nemotron-VLM-Dataset-v1 --repo-type dataset" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "DATASET=$DATASET is not recognized; use 'visionarena' or 'nemotron'." >&2
+            exit 1
+            ;;
+    esac
+}
+
 # What the prepared dataset's contents depend on. prepare_data.py decides whether
 # to skip purely on the presence of *.arrow, so raising MAX_SAMPLES against an
 # existing directory is otherwise ignored in silence and training keeps using the
 # smaller dataset -- along with a token_freq.pt built from it.
+#
+# The export settings are included because the conversation count alone cannot
+# separate two different selections of the same size: switching partitions or
+# changing the fraction at a fixed total would reuse a dataset built from other
+# rows.
 prepare_signature() {
     local num_conversations=0
     if [[ -f "$CONVERSATIONS_FILE" ]]; then
         num_conversations=$(wc -l < "$CONVERSATIONS_FILE" | tr -d '[:space:]')
     fi
-    echo "max_samples=$MAX_SAMPLES seq_length=$SEQ_LENGTH conversations=$num_conversations"
+    local source="dataset=$DATASET"
+    case "$DATASET" in
+        visionarena)
+            source+=" limit=$EXPORT_LIMIT turns=$MAX_TURNS lang=${EXPORT_LANGUAGE:-all}"
+            ;;
+        nemotron)
+            source+=" partitions=${NEMOTRON_PARTITIONS:-all} fraction=$EXPORT_FRACTION"
+            source+=" seed=$EXPORT_SEED"
+            ;;
+    esac
+    echo "$source max_samples=${MAX_SAMPLES:-all} seq_length=$SEQ_LENGTH conversations=$num_conversations"
 }
 
 # The trainer resumes by starting at last_checkpoint_epoch + 1, so once that
@@ -232,25 +328,77 @@ check_gpus() {
         exit 1
     fi
 
-    local needed
-    needed=$(( $(tr ',' ' ' <<< "$EXTRACT_GPUS" | wc -w) + $(tr ',' ' ' <<< "$TRAIN_GPUS" | wc -w) ))
+    local num_extract num_train num_regen
+    num_extract=$(tr ',' ' ' <<< "$EXTRACT_GPUS" | wc -w)
+    num_train=$(tr ',' ' ' <<< "$TRAIN_GPUS" | wc -w)
+    num_regen=$(tr ',' ' ' <<< "$REGEN_GPUS" | wc -w)
+
+    local needed=$(( num_extract + num_train ))
     if [[ "$available" -lt "$needed" ]]; then
         echo "Need $needed GPUs for EXTRACT_GPUS + TRAIN_GPUS but only $available are visible." >&2
         echo "Set EXTRACT_GPUS, TRAIN_GPUS, NUM_TRAIN_GPUS, EXTRACT_DP_SIZE, REGEN_GPUS and" >&2
         echo "REGEN_TP to match your allocation." >&2
         exit 1
     fi
-    echo "$available GPUs visible."
+
+    # Step 7 runs the trainer against the live server, so the two cannot share a
+    # device: they would contend for memory and for the same SMs.
+    local overlap=""
+    for gpu in $(tr ',' ' ' <<< "$EXTRACT_GPUS"); do
+        for other in $(tr ',' ' ' <<< "$TRAIN_GPUS"); do
+            [[ "$gpu" == "$other" ]] && overlap+=" $gpu"
+        done
+    done
+    if [[ -n "$overlap" ]]; then
+        echo "EXTRACT_GPUS ($EXTRACT_GPUS) and TRAIN_GPUS ($TRAIN_GPUS) both use:$overlap" >&2
+        echo "Online training runs the extraction server and the trainer at the same" >&2
+        echo "time, so they need disjoint devices." >&2
+        exit 1
+    fi
+
+    # A parallelism product below the GPU count is not an error to vLLM or
+    # torchrun -- they just use fewer devices -- so it would otherwise show up
+    # only as an unexplained shortfall in throughput.
+    if (( REGEN_DP * REGEN_TP != num_regen )); then
+        echo "REGEN_DP($REGEN_DP) * REGEN_TP($REGEN_TP) = $(( REGEN_DP * REGEN_TP )), but" >&2
+        echo "REGEN_GPUS lists $num_regen GPUs. Regeneration would leave the rest idle." >&2
+        exit 1
+    fi
+    if (( EXTRACT_DP_SIZE * EXTRACT_TP != num_extract )); then
+        echo "EXTRACT_DP_SIZE($EXTRACT_DP_SIZE) * EXTRACT_TP($EXTRACT_TP) = $(( EXTRACT_DP_SIZE * EXTRACT_TP ))," >&2
+        echo "but EXTRACT_GPUS lists $num_extract GPUs. The extras would sit idle." >&2
+        exit 1
+    fi
+    if (( NUM_TRAIN_GPUS != num_train )); then
+        echo "NUM_TRAIN_GPUS($NUM_TRAIN_GPUS) does not match the $num_train GPUs in" >&2
+        echo "TRAIN_GPUS ($TRAIN_GPUS); torchrun would size the job to the wrong count." >&2
+        exit 1
+    fi
+
+    echo "$available GPUs visible: extract=$EXTRACT_GPUS (dp$EXTRACT_DP_SIZE x tp$EXTRACT_TP), train=$TRAIN_GPUS, regen=$REGEN_GPUS (dp$REGEN_DP x tp$REGEN_TP)"
 }
 
+check_dataset_config
+
 echo "=== Configuration ==="
-echo "  model=$MODEL export_limit=$EXPORT_LIMIT max_samples=$MAX_SAMPLES"
-echo "  epochs=$EPOCHS lr=$LR seq_length=$SEQ_LENGTH max_turns=$MAX_TURNS"
+echo "  model=$MODEL dataset=$DATASET max_samples=${MAX_SAMPLES:-all}"
+echo "  epochs=$EPOCHS lr=$LR seq_length=$SEQ_LENGTH"
 echo "  output_dir=$OUTPUT_DIR port=$SERVER_PORT"
+case "$DATASET" in
+    visionarena)
+        echo "  export_limit=$EXPORT_LIMIT max_turns=$MAX_TURNS language=${EXPORT_LANGUAGE:-all}"
+        ;;
+    nemotron)
+        echo "  partitions=${NEMOTRON_PARTITIONS:-all with images} fraction=$EXPORT_FRACTION seed=$EXPORT_SEED"
+        if [[ -n "$NEMOTRON_SKIP_DOWNLOAD" ]]; then
+            echo "  image_download=disabled (images must already be present)"
+        fi
+        ;;
+esac
 if [[ -n "$EXPORT_ALLOW_DOWNLOAD" ]]; then
-    echo "  dataset=streaming from the Hub (downloads shards)"
+    echo "  source=streaming from the Hub (downloads shards)"
 else
-    echo "  dataset=${DATASET_PATH:-HuggingFace cache (${HF_HOME:-~/.cache/huggingface})}"
+    echo "  source=${DATASET_PATH:-HuggingFace cache (${HF_HOME:-~/.cache/huggingface})}"
 fi
 echo "  checkpoint_dir=$CHECKPOINT_DIR checkpoint_freq=$CHECKPOINT_FREQ"
 check_gpus
@@ -260,27 +408,80 @@ check_training_would_run
 
 mkdir -p "$OUTPUT_DIR"
 
-# Step 1: Export VisionArena prompts and materialize their images (CPU only)
+# Step 0: Fetch images for nemotron partitions that ship without them.
+# Only the OpenImages-backed partitions can be fetched; the others are rejected
+# by the downloader with a pointer to where their images live. Images land in
+# $IMAGE_DIR/<partition>_images/, keeping them under the one directory vLLM is
+# later given as --allowed-local-media-path.
+if [[ "$DATASET" == "nemotron" && -z "$NEMOTRON_SKIP_DOWNLOAD" && -n "$NEMOTRON_PARTITIONS" ]]; then
+    DOWNLOADABLE=""
+    for partition in ${NEMOTRON_PARTITIONS//,/ }; do
+        case "$partition" in
+            captioning_1|captioning_2|vqa_1|vqa_2|vqa_3)
+                DOWNLOADABLE+="${DOWNLOADABLE:+,}$partition"
+                ;;
+        esac
+    done
+    if [[ -n "$DOWNLOADABLE" ]]; then
+        echo "=== Step 0: Downloading images for $DOWNLOADABLE ==="
+        DOWNLOAD_ARGS=(
+            --partitions "$DOWNLOADABLE"
+            --fraction "$EXPORT_FRACTION"
+            --seed "$EXPORT_SEED"
+            --image-source "$IMAGE_DIR"
+            --concurrency "$NEMOTRON_DOWNLOAD_CONCURRENCY"
+        )
+        if [[ -n "$DATASET_PATH" ]]; then
+            DOWNLOAD_ARGS+=(--dataset-path "$DATASET_PATH")
+        fi
+        mkdir -p "$IMAGE_DIR"
+        python3 scripts/download_nemotron_images.py "${DOWNLOAD_ARGS[@]}"
+    fi
+fi
+
+# Step 1: Export prompts and materialize their images (CPU only)
 # Reads the local copy of the dataset -- the HuggingFace cache by default, or
-# DATASET_PATH -- so this step needs no network. --limit caps how many of the
-# ~199k conversations are used; only the shards it reaches are read.
-echo "=== Step 1: Exporting VisionArena prompts and images ==="
+# DATASET_PATH -- so this step needs no network. Both exports write the same
+# prompt-only conversations, which is why steps 2-7 need no knowledge of which
+# dataset produced them.
+echo "=== Step 1: Exporting $DATASET prompts and images ==="
 EXPORT_ARGS=(
-    --limit "$EXPORT_LIMIT"
-    --max-turns "$MAX_TURNS"
     --image-dir "$IMAGE_DIR"
     --outfile "$PROMPTS_FILE"
     --resume
 )
-if [[ -n "$EXPORT_LANGUAGE" ]]; then
-    EXPORT_ARGS+=(--language "$EXPORT_LANGUAGE")
-fi
-if [[ -n "$EXPORT_ALLOW_DOWNLOAD" ]]; then
-    EXPORT_ARGS+=(--allow-download)
-elif [[ -n "$DATASET_PATH" ]]; then
-    EXPORT_ARGS+=(--dataset-path "$DATASET_PATH")
-fi
-python3 scripts/export_visionarena.py "${EXPORT_ARGS[@]}"
+case "$DATASET" in
+    visionarena)
+        EXPORT_SCRIPT=scripts/export_visionarena.py
+        EXPORT_ARGS+=(--limit "$EXPORT_LIMIT" --max-turns "$MAX_TURNS")
+        if [[ -n "$EXPORT_LANGUAGE" ]]; then
+            EXPORT_ARGS+=(--language "$EXPORT_LANGUAGE")
+        fi
+        if [[ -n "$EXPORT_ALLOW_DOWNLOAD" ]]; then
+            EXPORT_ARGS+=(--allow-download)
+        elif [[ -n "$DATASET_PATH" ]]; then
+            EXPORT_ARGS+=(--dataset-path "$DATASET_PATH")
+        fi
+        ;;
+    nemotron)
+        EXPORT_SCRIPT=scripts/export_nemotron_vlm.py
+        # --image-source adds $IMAGE_DIR to the places images are looked for,
+        # so step 0's downloads are found without hiding the TAR shards that
+        # ship beside the dataset's JSONL.
+        EXPORT_ARGS+=(
+            --fraction "$EXPORT_FRACTION"
+            --seed "$EXPORT_SEED"
+            --image-source "$IMAGE_DIR"
+        )
+        if [[ -n "$NEMOTRON_PARTITIONS" ]]; then
+            EXPORT_ARGS+=(--partitions "$NEMOTRON_PARTITIONS")
+        fi
+        if [[ -n "$DATASET_PATH" ]]; then
+            EXPORT_ARGS+=(--dataset-path "$DATASET_PATH")
+        fi
+        ;;
+esac
+python3 "$EXPORT_SCRIPT" "${EXPORT_ARGS[@]}"
 
 # Steps 2-4 only matter if something still needs regenerating. Ask before
 # committing to a model load: on a resubmitted run the answer is usually zero,
@@ -312,6 +513,7 @@ if [[ "$REMAINING" -gt 0 ]]; then
     echo "=== Step 2: Launching vLLM server for regeneration ==="
     CUDA_VISIBLE_DEVICES="$REGEN_GPUS" vllm serve "$MODEL" \
         --port "$SERVER_PORT" \
+        --data-parallel-size "$REGEN_DP" \
         --tensor-parallel-size "$REGEN_TP" \
         --max-model-len "$SEQ_LENGTH" \
         --allowed-local-media-path "$(realpath "$IMAGE_DIR")" \
@@ -389,13 +591,20 @@ fi
 # expands each image into its placeholder tokens, and derives the loss mask from
 # the assistant-turn boundary.
 echo "=== Step 6: Preparing data ==="
-python3 scripts/prepare_data.py \
-    --model "$MODEL" \
-    --data "$CONVERSATIONS_FILE" \
-    --output "$DATA_DIR" \
-    --render-endpoint "http://localhost:${SERVER_PORT}" \
-    --max-samples "$MAX_SAMPLES" \
+PREPARE_ARGS=(
+    --model "$MODEL"
+    --data "$CONVERSATIONS_FILE"
+    --output "$DATA_DIR"
+    --render-endpoint "http://localhost:${SERVER_PORT}"
     --seq-length "$SEQ_LENGTH"
+)
+# Omitted rather than passed as a sentinel: prepare_data.py treats an absent
+# --max-samples as "keep everything", which is what you want when the export
+# fraction is already the size knob.
+if [[ -n "$MAX_SAMPLES" ]]; then
+    PREPARE_ARGS+=(--max-samples "$MAX_SAMPLES")
+fi
+python3 scripts/prepare_data.py "${PREPARE_ARGS[@]}"
 
 # Recorded only now, so a preprocessing run that dies leaves no stamp and the
 # next run rebuilds rather than trusting a partial dataset.

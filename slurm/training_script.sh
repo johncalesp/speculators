@@ -28,12 +28,46 @@ mkdir -p logs
 # srun propagates the submitting environment into the container, so exporting
 # here is enough for the training script to pick these up.
 
+# Which dataset to train on: visionarena or nemotron. The rest of the pipeline
+# is identical either way; only step 1 differs.
+export DATASET="${DATASET:-visionarena}"
+# Directory holding the already-downloaded dataset. Empty reads the HuggingFace
+# cache at HF_HOME below.
+export DATASET_PATH="${DATASET_PATH:-}"
+# Set non-empty to stream visionarena from the Hub instead of reading a local
+# copy. Off by default: compute nodes often have no route to the Hub, and
+# pulling 84 GB of shards inside the job wastes the allocation.
+export EXPORT_ALLOW_DOWNLOAD="${EXPORT_ALLOW_DOWNLOAD:-}"
+
 # Data scale. EXPORT_LIMIT is a target size for the prompts file, not a per-run
 # quota, so resubmitting tops it up instead of appending another batch.
+# EXPORT_LIMIT, MAX_TURNS and EXPORT_LANGUAGE apply to visionarena only.
 export EXPORT_LIMIT="${EXPORT_LIMIT:-5000}"
-export MAX_SAMPLES="${MAX_SAMPLES:-5000}"
 export MAX_TURNS="${MAX_TURNS:-2}"
-export EXPORT_LANGUAGE="${EXPORT_LANGUAGE:-English}"   # e.g. English; empty keeps all
+# ${VAR-default}, not ${VAR:-default}: both of these have to be settable to the
+# empty string to mean "no cap" and "every language". With :- an explicit
+# MAX_SAMPLES= would silently fall back to 5000 and cap a full-dataset run.
+export MAX_SAMPLES="${MAX_SAMPLES-5000}"
+export EXPORT_LANGUAGE="${EXPORT_LANGUAGE-English}"    # e.g. English; empty keeps all
+
+# --- nemotron only ---
+# Comma-separated partitions, e.g. vqa_1 or ocr_1,vqa_9. Empty uses every
+# partition whose images are already on disk. Run
+#   python3 scripts/export_nemotron_vlm.py --list-partitions
+# to see the inventory.
+export NEMOTRON_PARTITIONS="${NEMOTRON_PARTITIONS:-}"
+# Size knob for nemotron, in place of MAX_SAMPLES: 1 = 100%, 0.05 = 5%.
+export EXPORT_FRACTION="${EXPORT_FRACTION:-0.01}"
+# Shared by the image download and the export so they agree on which rows are
+# in play. Changing it selects a different subset of the same size and orphans
+# the images already fetched.
+export EXPORT_SEED="${EXPORT_SEED:-0}"
+# Partitions whose images the repo does not ship but which can be fetched from
+# OpenImages (vqa_1, vqa_2, vqa_3, captioning_1, captioning_2) are downloaded in
+# step 0, at EXPORT_FRACTION -- so only the images the export will use are
+# fetched. Set non-empty to require them present already and fail instead.
+export NEMOTRON_SKIP_DOWNLOAD="${NEMOTRON_SKIP_DOWNLOAD:-}"
+export NEMOTRON_DOWNLOAD_CONCURRENCY="${NEMOTRON_DOWNLOAD_CONCURRENCY:-64}"
 
 # Training
 export SEQ_LENGTH="${SEQ_LENGTH:-8192}"
@@ -81,6 +115,10 @@ export LIMIT_MM_PER_PROMPT="${LIMIT_MM_PER_PROMPT:-{\"image\": 4\}}"
 # GPU layout. Defaults assume 4 visible GPUs; the training script fails fast if
 # the allocation is smaller. Align these with whatever this partition grants.
 export REGEN_GPUS="${REGEN_GPUS:-0,1,2,3}"
+# REGEN_DP * REGEN_TP must equal the REGEN_GPUS count, and REGEN_TP is capped by
+# the target's attention-head count (28 for Qwen2.5-VL-7B: 1, 2 or 4, not 8).
+# Beyond that cap, scale regeneration with replicas rather than wider tensors.
+export REGEN_DP="${REGEN_DP:-1}"
 export REGEN_TP="${REGEN_TP:-4}"
 export EXTRACT_GPUS="${EXTRACT_GPUS:-0,1}"
 export TRAIN_GPUS="${TRAIN_GPUS:-2,3}"
