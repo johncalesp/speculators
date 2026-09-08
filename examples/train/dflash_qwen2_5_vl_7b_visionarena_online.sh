@@ -711,6 +711,14 @@ export_visionarena_fraction() {
 
 export_nemotron_fraction() {
     local partition="$1" fraction="$2"
+    local image_source="$NEMOTRON_IMAGE_SOURCE"
+    # ChartQA is staged under this run's IMAGE_DIR, while OpenImages partitions
+    # may deliberately reuse NEMOTRON_IMAGE_SOURCE from an older run.
+    case "$partition" in
+        vqa_4|vqa_7|vqa_8)
+            image_source="$IMAGE_DIR"
+            ;;
+    esac
     local args=(
         --image-dir "$IMAGE_DIR"
         --outfile "$PROMPTS_FILE"
@@ -718,7 +726,7 @@ export_nemotron_fraction() {
         --partitions "$partition"
         --fraction "$fraction"
         --seed "$EXPORT_SEED"
-        --image-source "$NEMOTRON_IMAGE_SOURCE"
+        --image-source "$image_source"
     )
     if [[ -n "$NEMOTRON_DATASET_PATH" ]]; then
         args+=(--dataset-path "$NEMOTRON_DATASET_PATH")
