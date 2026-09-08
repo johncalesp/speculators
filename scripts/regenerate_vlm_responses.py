@@ -42,6 +42,7 @@ import argparse
 import asyncio
 import json
 import logging
+import re
 import sys
 import time
 from pathlib import Path
@@ -75,6 +76,21 @@ for _noisy in ("httpx", "httpcore", "urllib3", "hf_xet", "filelock", "fsspec"):
 # permanent config or client errors and fail fast.
 SERVER_ERROR_STATUS = 500
 RETRYABLE_HTTP_STATUSES = {408, 409, 425, 429}
+BAD_REQUEST_STATUS = 400
+_CONTEXT_LENGTH_RE = re.compile(
+    r"maximum context length is (\d+) tokens.*"
+    r"prompt contains at least (\d+) input tokens",
+    re.DOTALL,
+)
+
+
+class ContextLengthError(InvalidResponseError):
+    """A request whose output budget does not fit after prompt rendering."""
+
+    def __init__(self, message: str, max_context: int, input_tokens: int):
+        super().__init__(message)
+        self.max_context = max_context
+        self.input_tokens = input_tokens
 
 
 def parse_args() -> argparse.Namespace:
@@ -307,8 +323,15 @@ async def post_chat(
     """
     async with session.post(endpoint, json=payload) as response:
         if not response.ok:
-            body = (await response.text())[:500]
-            message = f"HTTP {response.status} from {endpoint}: {body}"
+            body = await response.text()
+            message = f"HTTP {response.status} from {endpoint}: {body[:500]}"
+            context_match = _CONTEXT_LENGTH_RE.search(body)
+            if response.status == BAD_REQUEST_STATUS and context_match:
+                raise ContextLengthError(
+                    message,
+                    max_context=int(context_match.group(1)),
+                    input_tokens=int(context_match.group(2)),
+                )
             if (
                 response.status >= SERVER_ERROR_STATUS
                 or response.status in RETRYABLE_HTTP_STATUSES
@@ -351,7 +374,18 @@ async def regenerate_conversation(
             "messages": wire,
             "max_tokens": max_tokens,
         }
-        data = await post_fn(payload)
+        while True:
+            try:
+                data = await post_fn(payload)
+                break
+            except ContextLengthError as error:
+                fitting_max_tokens = error.max_context - error.input_tokens
+                if (
+                    fitting_max_tokens <= 0
+                    or fitting_max_tokens >= payload["max_tokens"]
+                ):
+                    raise
+                payload["max_tokens"] = fitting_max_tokens
 
         choice = data["choices"][0]
         message = choice["message"]

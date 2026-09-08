@@ -916,6 +916,32 @@ def test_regeneration_does_not_let_sampling_params_override_owned_keys(tmp_path)
     assert payload["temperature"] == 0.7
 
 
+def test_regeneration_reduces_output_budget_to_fit_context():
+    payloads = []
+
+    async def endpoint(payload):
+        payloads.append(dict(payload))
+        if len(payloads) == 1:
+            raise regen.ContextLengthError(
+                "too long", max_context=100, input_tokens=60
+            )
+        return _reply("fits")
+
+    conversations, truncated = asyncio.run(
+        regen.regenerate_conversation(
+            endpoint,
+            [{"role": "user", "content": "describe this"}],
+            model="target",
+            max_tokens=64,
+            sampling_params={},
+        )
+    )
+
+    assert [payload["max_tokens"] for payload in payloads] == [64, 40]
+    assert conversations[-1]["content"] == "fits"
+    assert not truncated
+
+
 # ---------------------------------------------------------------------------
 # regenerate_vlm_responses.py: the worker, driven over a fake session
 # ---------------------------------------------------------------------------
@@ -952,6 +978,35 @@ class _FakeSession:
                 return False
 
         return _Ctx()
+
+
+def test_post_chat_identifies_vllm_context_length_error():
+    response = _FakeResponse(
+        {
+            "error": {
+                "message": (
+                    "This model's maximum context length is 8192 tokens. "
+                    "However, you requested 2048 output tokens and your prompt "
+                    "contains at least 6145 input tokens."
+                )
+            }
+        },
+        ok=False,
+        status=400,
+    )
+
+    with pytest.raises(regen.ContextLengthError) as exc_info:
+        asyncio.run(
+            regen.post_chat(
+                _FakeSession([response]),
+                "http://fake/v1/chat/completions",
+                {},
+                max_retries=0,
+            )
+        )
+
+    assert exc_info.value.max_context == 8192
+    assert exc_info.value.input_tokens == 6145
 
 
 class _Args:
