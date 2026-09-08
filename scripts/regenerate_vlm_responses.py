@@ -380,12 +380,22 @@ async def regenerate_conversation(
                 break
             except ContextLengthError as error:
                 fitting_max_tokens = error.max_context - error.input_tokens
+                # vLLM reports that the prompt contains *at least* N tokens,
+                # where N is often the first token beyond the current budget,
+                # not the fully rendered prompt length. Decrementing to
+                # max_context-N can therefore reduce the budget by one and
+                # trigger thousands of sequential 400s. Halving bounds this to
+                # logarithmically many probes while retaining more output room
+                # than a global low cap for prompts that fit normally.
+                reduced_max_tokens = min(
+                    fitting_max_tokens, max(1, payload["max_tokens"] // 2)
+                )
                 if (
-                    fitting_max_tokens <= 0
-                    or fitting_max_tokens >= payload["max_tokens"]
+                    reduced_max_tokens <= 0
+                    or reduced_max_tokens >= payload["max_tokens"]
                 ):
                     raise
-                payload["max_tokens"] = fitting_max_tokens
+                payload["max_tokens"] = reduced_max_tokens
 
         choice = data["choices"][0]
         message = choice["message"]
@@ -522,6 +532,28 @@ def build_work_items(rows: list[dict], completed: set[str]) -> list[dict]:
     return items
 
 
+def compact_error_file(path: Path, completed: set[str]) -> None:
+    """Keep only the latest error for IDs that still have no successful row."""
+    if not path.is_file():
+        return
+    unresolved: dict[str, dict] = {}
+    with path.open(encoding="utf-8") as handle:
+        for line in handle:
+            try:
+                row = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            conversation_id = str(row.get("conversation_id") or "")
+            if conversation_id and conversation_id not in completed:
+                unresolved[conversation_id] = row
+
+    temporary = path.with_name(path.name + ".tmp")
+    with temporary.open("w", encoding="utf-8") as handle:
+        for row in unresolved.values():
+            handle.write(json.dumps(row, ensure_ascii=False) + "\n")
+    temporary.replace(path)
+
+
 async def main() -> None:
     args = parse_args()
 
@@ -551,6 +583,7 @@ async def main() -> None:
 
     items = build_work_items(rows, completed)
     if not items:
+        compact_error_file(error_outfile, completed)
         logger.warning("Nothing to regenerate")
         return
 
@@ -589,6 +622,7 @@ async def main() -> None:
                 await queue.put(None)
             await asyncio.gather(*workers)
 
+    compact_error_file(error_outfile, load_completed_ids(args.outfile))
     log_summary(stats)
     logger.info("On-policy conversations written to %s", args.outfile)
     logger.info("Next: pass it to prepare_data.py --data %s", args.outfile)

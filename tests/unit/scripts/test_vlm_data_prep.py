@@ -937,7 +937,7 @@ def test_regeneration_reduces_output_budget_to_fit_context():
         )
     )
 
-    assert [payload["max_tokens"] for payload in payloads] == [64, 40]
+    assert [payload["max_tokens"] for payload in payloads] == [64, 32]
     assert conversations[-1]["content"] == "fits"
     assert not truncated
 
@@ -1007,6 +1007,26 @@ def test_post_chat_identifies_vllm_context_length_error():
 
     assert exc_info.value.max_context == 8192
     assert exc_info.value.input_tokens == 6145
+
+
+def test_error_compaction_drops_recovered_ids_and_duplicate_history(tmp_path):
+    errors = tmp_path / "conversations.errors.jsonl"
+    errors.write_text(
+        "\n".join(
+            json.dumps(row)
+            for row in [
+                {"conversation_id": "recovered", "error": "old"},
+                {"conversation_id": "failed", "error": "first"},
+                {"conversation_id": "failed", "error": "latest"},
+            ]
+        )
+        + "\n"
+    )
+
+    regen.compact_error_file(errors, {"recovered"})
+
+    rows = [json.loads(line) for line in errors.read_text().splitlines()]
+    assert rows == [{"conversation_id": "failed", "error": "latest"}]
 
 
 class _Args:
