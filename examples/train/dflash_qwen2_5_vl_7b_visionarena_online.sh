@@ -462,6 +462,15 @@ check_mix_signature() {
     if [[ -f "$MIX_STAMP" ]]; then
         existing=$(<"$MIX_STAMP")
     fi
+    if [[ -z "$existing" ]] \
+        && [[ -f "$PROMPTS_FILE" || -f "$CONVERSATIONS_FILE" || -d "$DATA_DIR" ]]; then
+        echo "OUTPUT_DIR=$OUTPUT_DIR already contains data from a run without" >&2
+        echo "a mix.stamp. Reusing it would retain old source rows and violate" >&2
+        echo "DATASET_PROPORTIONS=$DATASET_PROPORTIONS." >&2
+        echo "Use a new OUTPUT_DIR. NEMOTRON_IMAGE_SOURCE may still point at this" >&2
+        echo "directory's images/ parent so downloaded images are reused." >&2
+        exit 1
+    fi
     if [[ -n "$existing" && "$existing" != "$desired" ]] \
         && [[ -f "$PROMPTS_FILE" || -f "$CONVERSATIONS_FILE" || -d "$DATA_DIR" ]]; then
         echo "The requested dataset mix differs from $MIX_STAMP." >&2
