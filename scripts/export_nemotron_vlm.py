@@ -268,14 +268,27 @@ def loose_image_dir(root: Path, partition: str) -> Path | None:
     The partitions the repo ships images for use TAR shards, but the ones whose
     images come from an external source (OpenImages and friends, fetched by
     ``download_nemotron_images.py``) are plain files named by the ``image``
-    field. Any non-tar file counts, and the scan stops at the first one: these
-    directories hold up to a million entries.
+    field. ChartQA paths are nested below ``ChartQA Dataset/``, so after the
+    cheap top-level scan used by million-file OpenImages directories, recurse
+    until the first plain file. Symlinked partition directories are supported,
+    allowing vqa_4, vqa_7, and vqa_8 to share one ChartQA image tree.
     """
     image_dir = partition_image_dir(root, partition)
     if not image_dir.is_dir():
         return None
     for entry in image_dir.iterdir():
         if entry.suffix not in {".tar", ".partial"} and entry.is_file():
+            return image_dir
+        # vqa_4's paths start with chartqa/, while vqa_7/vqa_8 start with
+        # train/. A symlinked chartqa/ directory lets all three share one
+        # archive without copying it.
+        if entry.is_symlink() and entry.is_dir():
+            return image_dir
+    for _current_root, _dirs, files in os.walk(image_dir):
+        if any(
+            Path(name).suffix not in {".tar", ".partial"}
+            for name in files
+        ):
             return image_dir
     return None
 
@@ -562,6 +575,12 @@ def export_loose_partition(
     """
     name = partition["name"]
     image_dir = partition["loose_dir"]
+    allowed_roots = {image_dir.resolve()}
+    allowed_roots.update(
+        entry.resolve()
+        for entry in image_dir.iterdir()
+        if entry.is_symlink() and entry.is_dir()
+    )
 
     num_written = 0
     num_skipped = 0
@@ -569,9 +588,13 @@ def export_loose_partition(
 
     for member, rows in wanted.items():
         # The member name comes from the dataset, not from us, so it is confined
-        # to the image directory before use.
+        # to the image directory or one of its explicit directory symlink roots
+        # before use.
         candidate = (image_dir / member).resolve()
-        if image_dir.resolve() not in candidate.parents or not candidate.is_file():
+        if (
+            not any(root in candidate.parents for root in allowed_roots)
+            or not candidate.is_file()
+        ):
             num_missing += len(rows)
             continue
         written, skipped = _write_rows(rows, name, candidate, handle, progress)

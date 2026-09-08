@@ -9,7 +9,29 @@ These scripts build on-policy training data for a vision-language target model:
 | `download_nemotron_images.py` | Fetches images for the Nemotron partitions that ship without them             |
 | `regenerate_vlm_responses.py` | Regenerate assistant responses with the target model, on-policy               |
 
-The two exports emit the same prompt-only conversations, so everything downstream is shared: regeneration, then [`prepare_data.py`](prepare_data.md) like any other conversations JSONL. See `examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh` for a full recipe, where `DATASET=visionarena|nemotron` picks between them.
+The two exports emit the same prompt-only conversations, so everything downstream is shared: regeneration, then [`prepare_data.py`](prepare_data.md) like any other conversations JSONL. See `examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh` for a full recipe. It supports either the legacy `DATASET=visionarena|nemotron` selection or a mixed `DATASETS` list with one fraction per source.
+
+## Mixing VisionArena and Nemotron partitions
+
+`DATASETS` accepts `visionarena` plus individual Nemotron partition names. `DATASET_PROPORTIONS` is positional and must contain exactly one fraction in `(0, 1]` per source:
+
+```bash
+DATASETS=visionarena,vqa_1,vqa_4,vqa_7,vqa_8 \
+DATASET_PROPORTIONS=0.5,0.1,0.9,0.8,0.8 \
+MAX_SAMPLES= \
+CHARTQA_ROOT="/data/ChartQA Dataset" \
+bash examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh
+```
+
+This selects 50% of English VisionArena (unless `EXPORT_LANGUAGE=` is set), 10% of `vqa_1`, 90% of `vqa_4`, and 80% each of `vqa_7` and `vqa_8`. Selection is deterministic from `EXPORT_SEED`. Names and proportions are validated before downloads begin; five datasets with four proportions is an error rather than an implicit default.
+
+`vqa_1` images are fetched automatically at its requested fraction. `vqa_4`, `vqa_7`, and `vqa_8` all reference ChartQA images, which cannot be derived from the row metadata and must be obtained separately. Point `CHARTQA_ROOT` at the extracted ChartQA directory that directly contains `train/png`. The script maps `vqa_4`'s `chartqa/train/...` paths and `vqa_7`/`vqa_8`'s `train/...` paths onto that one tree, then computes a vLLM media allow-root covering both it and the regular output images. The archive is never copied. Set `ALLOWED_MEDIA_PATH` explicitly if the automatically computed common parent is broader than desired.
+
+Leave `MAX_SAMPLES=` empty when proportions should determine the final mixture. A non-empty `MAX_SAMPLES` shuffles and truncates the combined rows after export, so the final ratios are only approximate. To change a mixture in an existing output directory, remove `prompts.jsonl`, `conversations.jsonl`, `prepared/`, `prepared.stamp`, `checkpoints/`, and `mix.stamp`; `images/` can remain and will be reused. Alternatively, choose a new `OUTPUT_DIR`.
+
+If the repositories are not in the same HuggingFace cache, use `VISIONARENA_DATASET_PATH` and `NEMOTRON_DATASET_PATH`. The legacy `DATASET_PATH` is rejected in mixed mode because one path cannot identify both repositories.
+
+Existing Nemotron image downloads can be reused without copying. Set `NEMOTRON_IMAGE_SOURCE` to the **parent** containing partition directories—not to the partition directory itself. For example, if the files are under `/shared/old-run/images/vqa_1_images/`, use `NEMOTRON_IMAGE_SOURCE=/shared/old-run/images`. The downloader skips files already present there, the exporter references them in place, and the script includes that resolved location in vLLM's media allow-root. This reuses `vqa_1`'s OpenImages only; it does not replace the separate `CHARTQA_ROOT` required by `vqa_4`, `vqa_7`, and `vqa_8`.
 
 ## Why multimodal needs its own path
 
@@ -50,6 +72,7 @@ Output rows are prompt-only, so they are an intermediate artifact: `prepare_data
 **Parameters:**
 
 - `--limit` - target number of conversations to use out of the ~199k. Rows are read as a stream, so a small limit touches only the shards it reaches rather than loading all ~84GB. With `--resume`, existing rows count toward the limit, so rerunning tops the file up instead of appending a second batch.
+- `--fraction` - deterministic fraction of rows to keep after language filtering. It uses the same nested hash-threshold semantics as Nemotron; raising the fraction preserves every previously selected row. It can be combined with `--limit`, which caps the selected rows.
 - `--dataset-path` - directory holding the downloaded dataset: parquet shards (searched recursively) or a `save_to_disk` directory. Defaults to the cached snapshot in the HuggingFace cache (`$HF_HOME`, else `~/.cache/huggingface`). A cache entry holding only `README.md` is rejected rather than treated as an empty dataset.
 - `--allow-download` - stream from the Hub instead, downloading the shards the run reaches. Off by default so a run cannot silently pull tens of GB.
 - `--image-dir` - where image bytes are written. Filenames are content hashes, so reruns and images shared between conversations cost nothing. Pass this directory to vLLM as `--allowed-local-media-path`.

@@ -1,9 +1,9 @@
 #!/bin/bash
 # Online DFlash Training Script -- Vision-Language Target Model
 #
-# Trains a DFlash drafter for Qwen2.5-VL-7B-Instruct on real user vision prompts
-# from lmarena-ai/VisionArena-Chat, with responses regenerated on-policy by the
-# target model itself.
+# Trains a DFlash drafter for Qwen2.5-VL-7B-Instruct on VisionArena, Nemotron
+# VLM partitions, or a proportional mixture, with responses regenerated
+# on-policy by the target model itself.
 #
 # Usage: Copy this script, modify the configuration variables below, then run:
 #   bash examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh
@@ -57,6 +57,13 @@
 #
 # (the dataset has ~199k conversations total)
 #
+# A mixed run uses one proportion per source:
+#
+#   DATASETS=visionarena,vqa_1,vqa_4,vqa_7,vqa_8 \
+#   DATASET_PROPORTIONS=0.5,0.1,0.9,0.8,0.8 MAX_SAMPLES= \
+#   CHARTQA_ROOT="/data/ChartQA Dataset" \
+#     bash examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh
+#
 # Budget for it: regenerating 200k multi-turn responses is the dominant cost,
 # far more than training. Step 1 expects the dataset to be downloaded already
 # and reads it from disk, so raising EXPORT_LIMIT costs no bandwidth -- but the
@@ -96,12 +103,25 @@ SERVER_PORT="${SERVER_PORT:-8000}"
 #                 documents and charts, selected by partition
 DATASET="${DATASET:-visionarena}"
 
+# Mixed mode. DATASETS names VisionArena and individual Nemotron partitions;
+# DATASET_PROPORTIONS supplies one deterministic fraction per entry. Counts and
+# order must match. For example:
+#   DATASETS=visionarena,vqa_1,vqa_4,vqa_7,vqa_8
+#   DATASET_PROPORTIONS=0.5,0.1,0.9,0.8,0.8
+# Leave DATASETS empty to retain the legacy DATASET/NEMOTRON_PARTITIONS mode.
+DATASETS="${DATASETS:-}"
+DATASET_PROPORTIONS="${DATASET_PROPORTIONS:-}"
+
 # Step 1 reads an already-downloaded dataset and never hits the network. Leave
 # this empty to use the HuggingFace cache ($HF_HOME, else ~/.cache/huggingface),
 # or point it at the directory holding the dataset. Populate the cache with
 #   hf download lmarena-ai/VisionArena-Chat --repo-type dataset
 #   hf download nvidia/Llama-Nemotron-VLM-Dataset-v1 --repo-type dataset
 DATASET_PATH="${DATASET_PATH:-}"
+# A mixed run may keep the two repositories in different directories. These
+# overrides avoid passing one repository's DATASET_PATH to the other exporter.
+VISIONARENA_DATASET_PATH="${VISIONARENA_DATASET_PATH:-}"
+NEMOTRON_DATASET_PATH="${NEMOTRON_DATASET_PATH:-}"
 
 # --- visionarena only ---
 EXPORT_LIMIT="${EXPORT_LIMIT:-5000}"        # conversations to export
@@ -140,6 +160,15 @@ NEMOTRON_DOWNLOAD_CONCURRENCY="${NEMOTRON_DOWNLOAD_CONCURRENCY:-64}"
 # which rows are in play; changing it selects a different subset of the same
 # size and orphans the images already fetched.
 EXPORT_SEED="${EXPORT_SEED:-0}"
+# vqa_4, vqa_7 and vqa_8 use the same ChartQA image archive, which is not
+# downloadable from the Nemotron row metadata. Point this at the extracted
+# "ChartQA Dataset" directory; mixed mode creates three lightweight symlinks
+# under IMAGE_DIR rather than copying the archive.
+CHARTQA_ROOT="${CHARTQA_ROOT:-}"
+# Optional explicit vLLM media allow-root. When ChartQA is symlinked from
+# outside OUTPUT_DIR, the script otherwise computes the narrowest common parent
+# of IMAGE_DIR and CHARTQA_ROOT so vLLM can resolve both real paths.
+ALLOWED_MEDIA_PATH="${ALLOWED_MEDIA_PATH:-}"
 
 # Cap on training rows kept after preprocessing. Leave empty to keep everything
 # the export produced, which is what you want when EXPORT_FRACTION is already
@@ -207,12 +236,16 @@ EXTRACT_TP="${EXTRACT_TP:-1}"
 # =======================================
 
 IMAGE_DIR="$OUTPUT_DIR/images"
+# Additional root containing <partition>_images directories. Step 0 defaults
+# here so downloaded OpenImages and staged ChartQA remain under one media root.
+NEMOTRON_IMAGE_SOURCE="${NEMOTRON_IMAGE_SOURCE:-$IMAGE_DIR}"
 PROMPTS_FILE="$OUTPUT_DIR/prompts.jsonl"
 CONVERSATIONS_FILE="$OUTPUT_DIR/conversations.jsonl"
 DATA_DIR="$OUTPUT_DIR/prepared"
 # Kept outside DATA_DIR: prepare_data.py --overwrite refuses to run against a
 # directory holding anything it did not write itself.
 PREPARE_STAMP="$OUTPUT_DIR/prepared.stamp"
+MIX_STAMP="$OUTPUT_DIR/mix.stamp"
 # Separate knob so a rerun at a larger scale can train into a clean directory
 # while still reusing the exported prompts, images and regenerated responses.
 CHECKPOINT_DIR="${CHECKPOINT_DIR:-$OUTPUT_DIR/checkpoints}"
@@ -229,9 +262,78 @@ cleanup() {
 }
 trap cleanup EXIT
 
-# Only the two exports exist, and an unrecognized name would otherwise leave
-# EXPORT_SCRIPT unset and fail inside step 1 as an unbound-variable error.
+MIX_DATASETS=()
+MIX_PROPORTIONS=()
+
+trim_space() {
+    local value="$1"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    printf '%s' "$value"
+}
+
+# Parse mixed mode once up front. Positional fractions intentionally require an
+# exact count: silently shifting one value onto the next partition would train
+# a materially different data mixture.
 check_dataset_config() {
+    if [[ -n "$DATASETS" ]]; then
+        if [[ -z "$DATASET_PROPORTIONS" ]]; then
+            echo "DATASETS requires DATASET_PROPORTIONS with one fraction per source." >&2
+            exit 1
+        fi
+
+        local raw_datasets=() raw_proportions=()
+        IFS=',' read -r -a raw_datasets <<< "$DATASETS"
+        IFS=',' read -r -a raw_proportions <<< "$DATASET_PROPORTIONS"
+        if (( ${#raw_datasets[@]} != ${#raw_proportions[@]} )); then
+            echo "DATASETS lists ${#raw_datasets[@]} sources but DATASET_PROPORTIONS" >&2
+            echo "lists ${#raw_proportions[@]} values; provide exactly one per source." >&2
+            exit 1
+        fi
+
+        local index source proportion seen=""
+        for index in "${!raw_datasets[@]}"; do
+            source=$(trim_space "${raw_datasets[$index]}")
+            proportion=$(trim_space "${raw_proportions[$index]}")
+            if [[ "$source" != "visionarena" ]] \
+                && ! [[ "$source" =~ ^(vqa|ocr|captioning)_[0-9]+$ ]]; then
+                echo "Unknown mixed dataset '$source'; use visionarena or a" >&2
+                echo "Nemotron partition such as vqa_1, ocr_4, captioning_1." >&2
+                exit 1
+            fi
+            if [[ ",$seen," == *",$source,"* ]]; then
+                echo "DATASETS contains '$source' more than once." >&2
+                exit 1
+            fi
+            if ! [[ "$proportion" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] \
+                || ! awk -v value="$proportion" \
+                    'BEGIN { exit !(value > 0 && value <= 1) }'; then
+                echo "Invalid proportion '$proportion' for $source; use a value in (0, 1]." >&2
+                exit 1
+            fi
+            MIX_DATASETS+=("$source")
+            MIX_PROPORTIONS+=("$proportion")
+            seen+="${seen:+,}$source"
+        done
+
+        if [[ -n "$DATASET_PATH" ]]; then
+            echo "DATASET_PATH is ambiguous in mixed mode. Leave it empty to use" >&2
+            echo "HF_HOME, or set VISIONARENA_DATASET_PATH and/or" >&2
+            echo "NEMOTRON_DATASET_PATH explicitly." >&2
+            exit 1
+        fi
+        if [[ -n "$MAX_SAMPLES" ]]; then
+            echo "Warning: MAX_SAMPLES=$MAX_SAMPLES truncates after mixing and can" >&2
+            echo "alter the requested proportions; set MAX_SAMPLES= to keep the mix." >&2
+        fi
+        return
+    fi
+
+    if [[ -n "$DATASET_PROPORTIONS" ]]; then
+        echo "DATASET_PROPORTIONS was set without DATASETS." >&2
+        exit 1
+    fi
+
     case "$DATASET" in
         visionarena) ;;
         nemotron)
@@ -264,16 +366,23 @@ prepare_signature() {
     if [[ -f "$CONVERSATIONS_FILE" ]]; then
         num_conversations=$(wc -l < "$CONVERSATIONS_FILE" | tr -d '[:space:]')
     fi
-    local source="dataset=$DATASET"
-    case "$DATASET" in
-        visionarena)
-            source+=" limit=$EXPORT_LIMIT turns=$MAX_TURNS lang=${EXPORT_LANGUAGE:-all}"
-            ;;
-        nemotron)
-            source+=" partitions=${NEMOTRON_PARTITIONS:-all} fraction=$EXPORT_FRACTION"
-            source+=" seed=$EXPORT_SEED"
-            ;;
-    esac
+    local source
+    if [[ -n "$DATASETS" ]]; then
+        source="datasets=$DATASETS proportions=$DATASET_PROPORTIONS"
+        source+=" turns=$MAX_TURNS lang=${EXPORT_LANGUAGE:-all} seed=$EXPORT_SEED"
+    else
+        source="dataset=$DATASET"
+        case "$DATASET" in
+            visionarena)
+                source+=" limit=$EXPORT_LIMIT turns=$MAX_TURNS lang=${EXPORT_LANGUAGE:-all}"
+                source+=" seed=$EXPORT_SEED"
+                ;;
+            nemotron)
+                source+=" partitions=${NEMOTRON_PARTITIONS:-all} fraction=$EXPORT_FRACTION"
+                source+=" seed=$EXPORT_SEED"
+                ;;
+        esac
+    fi
     echo "$source max_samples=${MAX_SAMPLES:-all} seq_length=$SEQ_LENGTH conversations=$num_conversations"
 }
 
@@ -345,6 +454,28 @@ check_output_dir() {
     fi
 }
 
+check_mix_signature() {
+    [[ -n "$DATASETS" ]] || return 0
+    local desired existing=""
+    desired="datasets=$DATASETS proportions=$DATASET_PROPORTIONS seed=$EXPORT_SEED"
+    desired+=" turns=$MAX_TURNS language=${EXPORT_LANGUAGE:-all}"
+    if [[ -f "$MIX_STAMP" ]]; then
+        existing=$(<"$MIX_STAMP")
+    fi
+    if [[ -n "$existing" && "$existing" != "$desired" ]] \
+        && [[ -f "$PROMPTS_FILE" || -f "$CONVERSATIONS_FILE" || -d "$DATA_DIR" ]]; then
+        echo "The requested dataset mix differs from $MIX_STAMP." >&2
+        echo "Existing: $existing" >&2
+        echo "Requested: $desired" >&2
+        echo "Use a new OUTPUT_DIR, or remove prompts.jsonl, conversations.jsonl," >&2
+        echo "prepared/, prepared.stamp, checkpoints/, and mix.stamp first." >&2
+        echo "The images/ directory may be kept and reused." >&2
+        exit 1
+    fi
+    printf '%s\n' "$desired" > "$MIX_STAMP.tmp"
+    mv "$MIX_STAMP.tmp" "$MIX_STAMP"
+}
+
 check_gpus() {
     local available
     available=$(nvidia-smi --list-gpus 2>/dev/null | wc -l)
@@ -406,106 +537,265 @@ check_gpus() {
 check_dataset_config
 
 echo "=== Configuration ==="
-echo "  model=$MODEL dataset=$DATASET max_samples=${MAX_SAMPLES:-all}"
+if [[ -n "$DATASETS" ]]; then
+    echo "  model=$MODEL datasets=$DATASETS max_samples=${MAX_SAMPLES:-all}"
+    echo "  proportions=$DATASET_PROPORTIONS seed=$EXPORT_SEED"
+else
+    echo "  model=$MODEL dataset=$DATASET max_samples=${MAX_SAMPLES:-all}"
+fi
 echo "  epochs=$EPOCHS lr=$LR seq_length=$SEQ_LENGTH"
 echo "  output_dir=$OUTPUT_DIR port=$SERVER_PORT"
-case "$DATASET" in
-    visionarena)
-        echo "  export_limit=$EXPORT_LIMIT max_turns=$MAX_TURNS language=${EXPORT_LANGUAGE:-all}"
-        ;;
-    nemotron)
-        echo "  partitions=${NEMOTRON_PARTITIONS:-all with images} fraction=$EXPORT_FRACTION seed=$EXPORT_SEED"
-        if [[ -n "$NEMOTRON_SKIP_DOWNLOAD" ]]; then
-            echo "  image_download=disabled (images must already be present)"
-        fi
-        ;;
-esac
-if [[ -n "$EXPORT_ALLOW_DOWNLOAD" ]]; then
-    echo "  source=streaming from the Hub (downloads shards)"
+if [[ -n "$DATASETS" ]]; then
+    echo "  visionarena: max_turns=$MAX_TURNS language=${EXPORT_LANGUAGE:-all}"
+    if [[ -n "$CHARTQA_ROOT" ]]; then
+        echo "  chartqa_root=$CHARTQA_ROOT"
+    fi
 else
-    echo "  source=${DATASET_PATH:-HuggingFace cache (${HF_HOME:-~/.cache/huggingface})}"
+    case "$DATASET" in
+        visionarena)
+            echo "  export_limit=$EXPORT_LIMIT max_turns=$MAX_TURNS language=${EXPORT_LANGUAGE:-all}"
+            ;;
+        nemotron)
+            echo "  partitions=${NEMOTRON_PARTITIONS:-all with images} fraction=$EXPORT_FRACTION seed=$EXPORT_SEED"
+            ;;
+    esac
+fi
+if [[ -n "$NEMOTRON_SKIP_DOWNLOAD" ]]; then
+    echo "  image_download=disabled (images must already be present)"
+fi
+if [[ -n "$EXPORT_ALLOW_DOWNLOAD" ]]; then
+    echo "  visionarena_source=streaming from the Hub (downloads shards)"
+elif [[ -n "$VISIONARENA_DATASET_PATH" ]]; then
+    echo "  visionarena_source=$VISIONARENA_DATASET_PATH"
+elif [[ -n "$DATASET_PATH" ]]; then
+    echo "  source=$DATASET_PATH"
+else
+    echo "  source=HuggingFace cache (${HF_HOME:-~/.cache/huggingface})"
+fi
+if [[ -n "$NEMOTRON_DATASET_PATH" ]]; then
+    echo "  nemotron_source=$NEMOTRON_DATASET_PATH"
 fi
 echo "  checkpoint_dir=$CHECKPOINT_DIR checkpoint_freq=$CHECKPOINT_FREQ"
 check_output_dir
+check_mix_signature
 check_gpus
 # Checked here rather than at step 7 so a run that could not train anything fails
 # now, instead of after the export, regeneration and preprocessing.
 check_training_would_run
 
-# Step 0: Fetch images for nemotron partitions that ship without them.
-# Only the OpenImages-backed partitions can be fetched; the others are rejected
-# by the downloader with a pointer to where their images live. Images land in
-# $IMAGE_DIR/<partition>_images/, keeping them under the one directory vLLM is
-# later given as --allowed-local-media-path.
-if [[ "$DATASET" == "nemotron" && -z "$NEMOTRON_SKIP_DOWNLOAD" && -n "$NEMOTRON_PARTITIONS" ]]; then
-    DOWNLOADABLE=""
-    for partition in ${NEMOTRON_PARTITIONS//,/ }; do
-        case "$partition" in
-            captioning_1|captioning_2|vqa_1|vqa_2|vqa_3)
-                DOWNLOADABLE+="${DOWNLOADABLE:+,}$partition"
+# Step 0a: expose one manually downloaded ChartQA tree as each partition's
+# expected <partition>_images directory. The links share the files; no images
+# are copied. The exporter validates that the JSONL paths exist below this root.
+if [[ -n "$DATASETS" && -n "$CHARTQA_ROOT" ]]; then
+    if [[ ! -d "$CHARTQA_ROOT" ]]; then
+        echo "CHARTQA_ROOT=$CHARTQA_ROOT is not a directory." >&2
+        exit 1
+    fi
+    chartqa_root=$(realpath "$CHARTQA_ROOT")
+    mkdir -p "$IMAGE_DIR"
+    for source in "${MIX_DATASETS[@]}"; do
+        case "$source" in
+            vqa_4)
+                chart_link="$IMAGE_DIR/${source}_images"
+                if [[ -L "$chart_link" ]]; then
+                    echo "$chart_link is a symlink from an older layout." >&2
+                    echo "Remove it once; vqa_4 now needs a chartqa/ wrapper directory." >&2
+                    exit 1
+                fi
+                if [[ -e "$chart_link" && ! -d "$chart_link" ]]; then
+                    echo "$chart_link exists but is not a directory." >&2
+                    exit 1
+                fi
+                mkdir -p "$chart_link"
+                # vqa_4 JSONL paths begin chartqa/train/...
+                if [[ -e "$chart_link/chartqa" && ! -L "$chart_link/chartqa" ]]; then
+                    echo "$chart_link/chartqa already exists; using it." >&2
+                else
+                    ln -sfn "$chartqa_root" "$chart_link/chartqa"
+                fi
+                ;;
+            vqa_7|vqa_8)
+                chart_link="$IMAGE_DIR/${source}_images"
+                # vqa_7/vqa_8 JSONL paths begin train/...
+                if [[ -e "$chart_link" && ! -L "$chart_link" ]]; then
+                    echo "$chart_link already exists and is not a symlink; using it." >&2
+                else
+                    ln -sfn "$chartqa_root" "$chart_link"
+                fi
                 ;;
         esac
     done
-    if [[ -n "$DOWNLOADABLE" ]]; then
-        echo "=== Step 0: Downloading images for $DOWNLOADABLE ==="
-        DOWNLOAD_ARGS=(
-            --partitions "$DOWNLOADABLE"
-            --fraction "$EXPORT_FRACTION"
-            --seed "$EXPORT_SEED"
-            --image-source "$IMAGE_DIR"
-            --concurrency "$NEMOTRON_DOWNLOAD_CONCURRENCY"
-        )
-        if [[ -n "$DATASET_PATH" ]]; then
-            DOWNLOAD_ARGS+=(--dataset-path "$DATASET_PATH")
+fi
+
+# Step 0b: fetch images for OpenImages-backed Nemotron partitions. In mixed
+# mode each invocation gets that partition's own fraction, guaranteeing that
+# download and export select exactly the same row IDs.
+if [[ -z "$NEMOTRON_SKIP_DOWNLOAD" ]]; then
+    if [[ -n "$DATASETS" ]]; then
+        for index in "${!MIX_DATASETS[@]}"; do
+            partition="${MIX_DATASETS[$index]}"
+            case "$partition" in
+                captioning_1|captioning_2|vqa_1|vqa_2|vqa_3)
+                    echo "=== Step 0: Downloading images for $partition (${MIX_PROPORTIONS[$index]}) ==="
+                    DOWNLOAD_ARGS=(
+                        --partitions "$partition"
+                        --fraction "${MIX_PROPORTIONS[$index]}"
+                        --seed "$EXPORT_SEED"
+                        --image-source "$NEMOTRON_IMAGE_SOURCE"
+                        --concurrency "$NEMOTRON_DOWNLOAD_CONCURRENCY"
+                    )
+                    if [[ -n "$NEMOTRON_DATASET_PATH" ]]; then
+                        DOWNLOAD_ARGS+=(--dataset-path "$NEMOTRON_DATASET_PATH")
+                    fi
+                    mkdir -p "$IMAGE_DIR"
+                    python3 scripts/download_nemotron_images.py "${DOWNLOAD_ARGS[@]}"
+                    ;;
+            esac
+        done
+    elif [[ "$DATASET" == "nemotron" && -n "$NEMOTRON_PARTITIONS" ]]; then
+        DOWNLOADABLE=""
+        for partition in ${NEMOTRON_PARTITIONS//,/ }; do
+            case "$partition" in
+                captioning_1|captioning_2|vqa_1|vqa_2|vqa_3)
+                    DOWNLOADABLE+="${DOWNLOADABLE:+,}$partition"
+                    ;;
+            esac
+        done
+        if [[ -n "$DOWNLOADABLE" ]]; then
+            echo "=== Step 0: Downloading images for $DOWNLOADABLE ==="
+            DOWNLOAD_ARGS=(
+                --partitions "$DOWNLOADABLE"
+                --fraction "$EXPORT_FRACTION"
+                --seed "$EXPORT_SEED"
+                --image-source "$NEMOTRON_IMAGE_SOURCE"
+                --concurrency "$NEMOTRON_DOWNLOAD_CONCURRENCY"
+            )
+            if [[ -n "$DATASET_PATH" ]]; then
+                DOWNLOAD_ARGS+=(--dataset-path "$DATASET_PATH")
+            fi
+            mkdir -p "$IMAGE_DIR"
+            python3 scripts/download_nemotron_images.py "${DOWNLOAD_ARGS[@]}"
         fi
-        mkdir -p "$IMAGE_DIR"
-        python3 scripts/download_nemotron_images.py "${DOWNLOAD_ARGS[@]}"
     fi
 fi
 
-# Step 1: Export prompts and materialize their images (CPU only)
-# Reads the local copy of the dataset -- the HuggingFace cache by default, or
-# DATASET_PATH -- so this step needs no network. Both exports write the same
-# prompt-only conversations, which is why steps 2-7 need no knowledge of which
-# dataset produced them.
-echo "=== Step 1: Exporting $DATASET prompts and images ==="
-EXPORT_ARGS=(
-    --image-dir "$IMAGE_DIR"
-    --outfile "$PROMPTS_FILE"
-    --resume
+export_visionarena_fraction() {
+    local fraction="$1"
+    local args=(
+        --image-dir "$IMAGE_DIR"
+        --outfile "$PROMPTS_FILE"
+        --resume
+        --fraction "$fraction"
+        --seed "$EXPORT_SEED"
+        --max-turns "$MAX_TURNS"
+    )
+    if [[ -n "$EXPORT_LANGUAGE" ]]; then
+        args+=(--language "$EXPORT_LANGUAGE")
+    fi
+    if [[ -n "$EXPORT_ALLOW_DOWNLOAD" ]]; then
+        args+=(--allow-download)
+    elif [[ -n "$VISIONARENA_DATASET_PATH" ]]; then
+        args+=(--dataset-path "$VISIONARENA_DATASET_PATH")
+    fi
+    python3 scripts/export_visionarena.py "${args[@]}"
+}
+
+export_nemotron_fraction() {
+    local partition="$1" fraction="$2"
+    local args=(
+        --image-dir "$IMAGE_DIR"
+        --outfile "$PROMPTS_FILE"
+        --resume
+        --partitions "$partition"
+        --fraction "$fraction"
+        --seed "$EXPORT_SEED"
+        --image-source "$NEMOTRON_IMAGE_SOURCE"
+    )
+    if [[ -n "$NEMOTRON_DATASET_PATH" ]]; then
+        args+=(--dataset-path "$NEMOTRON_DATASET_PATH")
+    fi
+    python3 scripts/export_nemotron_vlm.py "${args[@]}"
+}
+
+# Step 1: Export prompts and materialize their images (CPU only). All exporters
+# append namespaced conversation IDs to the same file, so regeneration and
+# training remain source-agnostic.
+if [[ -n "$DATASETS" ]]; then
+    echo "=== Step 1: Exporting mixed dataset prompts and images ==="
+    for index in "${!MIX_DATASETS[@]}"; do
+        source="${MIX_DATASETS[$index]}"
+        proportion="${MIX_PROPORTIONS[$index]}"
+        echo "--- $source: proportion=$proportion ---"
+        if [[ "$source" == "visionarena" ]]; then
+            export_visionarena_fraction "$proportion"
+        else
+            export_nemotron_fraction "$source" "$proportion"
+        fi
+    done
+else
+    echo "=== Step 1: Exporting $DATASET prompts and images ==="
+    EXPORT_ARGS=(
+        --image-dir "$IMAGE_DIR"
+        --outfile "$PROMPTS_FILE"
+        --resume
+    )
+    case "$DATASET" in
+        visionarena)
+            EXPORT_SCRIPT=scripts/export_visionarena.py
+            EXPORT_ARGS+=(--limit "$EXPORT_LIMIT" --max-turns "$MAX_TURNS")
+            if [[ -n "$EXPORT_LANGUAGE" ]]; then
+                EXPORT_ARGS+=(--language "$EXPORT_LANGUAGE")
+            fi
+            if [[ -n "$EXPORT_ALLOW_DOWNLOAD" ]]; then
+                EXPORT_ARGS+=(--allow-download)
+            elif [[ -n "$DATASET_PATH" ]]; then
+                EXPORT_ARGS+=(--dataset-path "$DATASET_PATH")
+            fi
+            ;;
+        nemotron)
+            EXPORT_SCRIPT=scripts/export_nemotron_vlm.py
+            EXPORT_ARGS+=(
+                --fraction "$EXPORT_FRACTION"
+                --seed "$EXPORT_SEED"
+                --image-source "$NEMOTRON_IMAGE_SOURCE"
+            )
+            if [[ -n "$NEMOTRON_PARTITIONS" ]]; then
+                EXPORT_ARGS+=(--partitions "$NEMOTRON_PARTITIONS")
+            fi
+            if [[ -n "$DATASET_PATH" ]]; then
+                EXPORT_ARGS+=(--dataset-path "$DATASET_PATH")
+            fi
+            ;;
+    esac
+    python3 "$EXPORT_SCRIPT" "${EXPORT_ARGS[@]}"
+fi
+
+# vLLM checks resolved paths, so allowing IMAGE_DIR alone is insufficient when
+# its ChartQA partition directories are symlinks to an external archive.
+if [[ -z "$ALLOWED_MEDIA_PATH" ]]; then
+    media_paths=("$IMAGE_DIR" "$NEMOTRON_IMAGE_SOURCE")
+    if [[ -n "$CHARTQA_ROOT" ]]; then
+        media_paths+=("$CHARTQA_ROOT")
+    fi
+    if (( ${#media_paths[@]} > 1 )); then
+        ALLOWED_MEDIA_PATH=$(python3 - "${media_paths[@]}" <<'PY'
+import os
+import sys
+
+print(os.path.commonpath([os.path.realpath(path) for path in sys.argv[1:]]))
+PY
 )
-case "$DATASET" in
-    visionarena)
-        EXPORT_SCRIPT=scripts/export_visionarena.py
-        EXPORT_ARGS+=(--limit "$EXPORT_LIMIT" --max-turns "$MAX_TURNS")
-        if [[ -n "$EXPORT_LANGUAGE" ]]; then
-            EXPORT_ARGS+=(--language "$EXPORT_LANGUAGE")
+        if [[ "$ALLOWED_MEDIA_PATH" == "/" ]]; then
+            echo "The image locations share only filesystem root (/)." >&2
+            echo "Move them under a common data directory, or explicitly set" >&2
+            echo "ALLOWED_MEDIA_PATH if allowing a broader path is intentional." >&2
+            exit 1
         fi
-        if [[ -n "$EXPORT_ALLOW_DOWNLOAD" ]]; then
-            EXPORT_ARGS+=(--allow-download)
-        elif [[ -n "$DATASET_PATH" ]]; then
-            EXPORT_ARGS+=(--dataset-path "$DATASET_PATH")
-        fi
-        ;;
-    nemotron)
-        EXPORT_SCRIPT=scripts/export_nemotron_vlm.py
-        # --image-source adds $IMAGE_DIR to the places images are looked for,
-        # so step 0's downloads are found without hiding the TAR shards that
-        # ship beside the dataset's JSONL.
-        EXPORT_ARGS+=(
-            --fraction "$EXPORT_FRACTION"
-            --seed "$EXPORT_SEED"
-            --image-source "$IMAGE_DIR"
-        )
-        if [[ -n "$NEMOTRON_PARTITIONS" ]]; then
-            EXPORT_ARGS+=(--partitions "$NEMOTRON_PARTITIONS")
-        fi
-        if [[ -n "$DATASET_PATH" ]]; then
-            EXPORT_ARGS+=(--dataset-path "$DATASET_PATH")
-        fi
-        ;;
-esac
-python3 "$EXPORT_SCRIPT" "${EXPORT_ARGS[@]}"
+    fi
+else
+    ALLOWED_MEDIA_PATH=$(realpath "$ALLOWED_MEDIA_PATH")
+fi
+echo "  allowed_local_media_path=$ALLOWED_MEDIA_PATH"
 
 # Steps 2-4 only matter if something still needs regenerating. Ask before
 # committing to a model load: on a resubmitted run the answer is usually zero,
@@ -540,7 +830,7 @@ if [[ "$REMAINING" -gt 0 ]]; then
         --data-parallel-size "$REGEN_DP" \
         --tensor-parallel-size "$REGEN_TP" \
         --max-model-len "$SEQ_LENGTH" \
-        --allowed-local-media-path "$(realpath "$IMAGE_DIR")" \
+        --allowed-local-media-path "$ALLOWED_MEDIA_PATH" \
         --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
         --limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT" &
     SERVER_PID=$!
@@ -572,7 +862,7 @@ CUDA_VISIBLE_DEVICES="$EXTRACT_GPUS" python3 scripts/launch_vllm.py "$MODEL" \
        --tensor-parallel-size "$EXTRACT_TP" \
        --port "$SERVER_PORT" \
        --max-model-len "$SEQ_LENGTH" \
-       --allowed-local-media-path "$(realpath "$IMAGE_DIR")" \
+       --allowed-local-media-path "$ALLOWED_MEDIA_PATH" \
        --mm-processor-kwargs "$MM_PROCESSOR_KWARGS" \
        --limit-mm-per-prompt "$LIMIT_MM_PER_PROMPT" &
 SERVER_PID=$!

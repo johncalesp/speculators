@@ -31,9 +31,15 @@ mkdir -p logs
 # Which dataset to train on: visionarena or nemotron. The rest of the pipeline
 # is identical either way; only step 1 differs.
 export DATASET="${DATASET:-visionarena}"
+# Mixed mode: one VisionArena/Nemotron source per proportion. Leave DATASETS
+# empty for the legacy DATASET/NEMOTRON_PARTITIONS behavior.
+export DATASETS="${DATASETS:-}"
+export DATASET_PROPORTIONS="${DATASET_PROPORTIONS:-}"
 # Directory holding the already-downloaded dataset. Empty reads the HuggingFace
 # cache at HF_HOME below.
 export DATASET_PATH="${DATASET_PATH:-}"
+export VISIONARENA_DATASET_PATH="${VISIONARENA_DATASET_PATH:-}"
+export NEMOTRON_DATASET_PATH="${NEMOTRON_DATASET_PATH:-}"
 # Set non-empty to stream visionarena from the Hub instead of reading a local
 # copy. Off by default: compute nodes often have no route to the Hub, and
 # pulling 84 GB of shards inside the job wastes the allocation.
@@ -62,6 +68,14 @@ export EXPORT_FRACTION="${EXPORT_FRACTION:-0.01}"
 # in play. Changing it selects a different subset of the same size and orphans
 # the images already fetched.
 export EXPORT_SEED="${EXPORT_SEED:-0}"
+# Extracted "ChartQA Dataset" root shared by vqa_4, vqa_7 and vqa_8. The
+# training script symlinks it rather than making three copies.
+export CHARTQA_ROOT="${CHARTQA_ROOT:-}"
+# Parent directory containing reusable <partition>_images directories, e.g.
+# /shared/old-run/images for /shared/old-run/images/vqa_1_images.
+export NEMOTRON_IMAGE_SOURCE="${NEMOTRON_IMAGE_SOURCE:-}"
+# Optional override for vLLM's local-media allow-root. Normally inferred.
+export ALLOWED_MEDIA_PATH="${ALLOWED_MEDIA_PATH:-}"
 # Partitions whose images the repo does not ship but which can be fetched from
 # OpenImages (vqa_1, vqa_2, vqa_3, captioning_1, captioning_2) are downloaded in
 # step 0, at EXPORT_FRACTION -- so only the images the export will use are

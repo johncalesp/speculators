@@ -452,6 +452,34 @@ def test_regeneration_can_read_the_nemotron_export(tmp_path):
 # ---------------------------------------------------------------------------
 
 
+def test_visionarena_fraction_sampling_is_deterministic_and_nested(row_ids):
+    tenth = {
+        row_id for row_id in row_ids if export.keeps_row(row_id, 0.1, seed=17)
+    }
+    half = {
+        row_id for row_id in row_ids if export.keeps_row(row_id, 0.5, seed=17)
+    }
+
+    assert tenth
+    assert tenth < half
+    assert tenth == {
+        row_id for row_id in row_ids if export.keeps_row(row_id, 0.1, seed=17)
+    }
+
+
+def test_visionarena_fraction_sampling_uses_its_own_namespace(row_ids):
+    visionarena_ids = {
+        row_id for row_id in row_ids if export.keeps_row(row_id, 0.1, seed=0)
+    }
+    nemotron_ids = {
+        row_id
+        for row_id in row_ids
+        if nemotron.keeps_row("visionarena", row_id, 0.1, seed=0)
+    }
+
+    assert visionarena_ids == nemotron_ids
+
+
 def _kept(fraction: float, ids: list[str], partition: str = "ocr_1") -> set[str]:
     return {i for i in ids if nemotron.keeps_row(partition, i, fraction, seed=0)}
 
@@ -1257,6 +1285,46 @@ def test_a_partial_download_does_not_count_as_a_loose_image(tmp_path):
     (tmp_path / "vqa_1_images" / "0.jpg.partial").write_bytes(_JPEG)
 
     assert nemotron.loose_image_dir(tmp_path, "vqa_1") is None
+
+
+def test_nested_chartqa_tree_counts_as_loose_images_through_symlink(tmp_path):
+    chartqa = tmp_path / "ChartQA Dataset"
+    image = chartqa / "train" / "png" / "chart.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(_JPEG)
+    partition_dir = tmp_path / "vqa_4_images"
+    partition_dir.mkdir()
+    (partition_dir / "chartqa").symlink_to(chartqa, target_is_directory=True)
+
+    assert nemotron.loose_image_dir(tmp_path, "vqa_4") == partition_dir
+    assert (partition_dir / "chartqa/train/png/chart.png").resolve() == image
+
+
+def test_vqa4_export_accepts_image_below_explicit_chartqa_symlink(tmp_path):
+    chartqa = tmp_path / "ChartQA Dataset"
+    image = chartqa / "train" / "png" / "chart.png"
+    image.parent.mkdir(parents=True)
+    image.write_bytes(_JPEG)
+    partition_dir = tmp_path / "vqa_4_images"
+    partition_dir.mkdir()
+    (partition_dir / "chartqa").symlink_to(chartqa, target_is_directory=True)
+    row = dict(
+        _NEMOTRON_ROW,
+        id="chart-id",
+        image="chartqa/train/png/chart.png",
+    )
+    partition = {"name": "vqa_4", "loose_dir": partition_dir}
+    outfile = tmp_path / "prompts.jsonl"
+
+    with outfile.open("w", encoding="utf-8") as handle:
+        written, skipped, missing = nemotron.export_loose_partition(
+            partition,
+            {row["image"]: [row]},
+            handle,
+            tqdm_stub(),
+        )
+
+    assert (written, skipped, missing) == (1, 0, 0)
 
 
 def test_an_imageless_downloadable_partition_is_told_how_to_get_its_images(tmp_path):

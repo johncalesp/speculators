@@ -151,6 +151,18 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--fraction",
+        type=float,
+        default=None,
+        help=(
+            "Deterministically keep this fraction of rows after language "
+            "filtering: 1 = all, 0.5 = half, 0.01 = one percent. Selection is "
+            "a hash threshold on conversation_id, so it is stable and nested "
+            "when the fraction increases. May be combined with --limit, which "
+            "then caps the selected rows."
+        ),
+    )
+    parser.add_argument(
         "--language",
         type=str,
         default=None,
@@ -203,6 +215,8 @@ def parse_args() -> argparse.Namespace:
 
     if args.limit is not None and args.limit <= 0:
         parser.error("--limit must be > 0")
+    if args.fraction is not None and not 0.0 < args.fraction <= 1.0:
+        parser.error("--fraction must be in (0, 1]")
     if args.max_turns is not None and args.max_turns <= 0:
         parser.error("--max-turns must be > 0")
     if args.shuffle_buffer_size < 0:
@@ -474,6 +488,31 @@ def iter_dataset(
     return iter(dataset)
 
 
+def keeps_row(conversation_id: str, fraction: float, seed: int) -> bool:
+    """Deterministically select a nested fraction of VisionArena rows."""
+    if fraction >= 1.0:
+        return True
+    digest = hashlib.sha256(
+        f"{seed}:visionarena:{conversation_id}".encode()
+    ).digest()
+    return int.from_bytes(digest[:8], "big") < fraction * (1 << 64)
+
+
+def selected_conversation_id(
+    row: dict, language: str | None, fraction: float | None, seed: int
+) -> str | None:
+    """Return a stable ID when a row belongs to the requested selection."""
+    if language is not None and row.get("language") != language:
+        return None
+    conversation_id = row.get("conversation_id")
+    if conversation_id is None:
+        return None
+    conversation_id = str(conversation_id)
+    if fraction is not None and not keeps_row(conversation_id, fraction, seed):
+        return None
+    return conversation_id
+
+
 def main() -> None:
     args = parse_args()
 
@@ -532,9 +571,12 @@ def main() -> None:
         for row in rows:
             if args.limit is not None and num_existing + num_exported >= args.limit:
                 break
-            if args.language is not None and row.get("language") != args.language:
+            conversation_id = selected_conversation_id(
+                row, args.language, args.fraction, args.seed
+            )
+            if conversation_id is None:
                 continue
-            if row.get("conversation_id") in exported_ids:
+            if conversation_id in exported_ids:
                 continue
 
             exported = build_row(
