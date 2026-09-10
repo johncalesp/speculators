@@ -6,10 +6,11 @@ These scripts build on-policy training data for a vision-language target model:
 | ----------------------------- | ----------------------------------------------------------------------------- |
 | `export_visionarena.py`       | Turn a local VisionArena-Chat copy into prompt-only conversations plus images |
 | `export_nemotron_vlm.py`      | Same, for Llama-Nemotron-VLM-Dataset-v1, selected by partition and fraction   |
+| `export_cauldron.py`          | Export independently sampled Cauldron questions and materialize their images  |
 | `download_nemotron_images.py` | Fetches images for the Nemotron partitions that ship without them             |
 | `regenerate_vlm_responses.py` | Regenerate assistant responses with the target model, on-policy               |
 
-The two exports emit the same prompt-only conversations, so everything downstream is shared: regeneration, then [`prepare_data.py`](prepare_data.md) like any other conversations JSONL. See `examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh` for a full recipe. It supports either the legacy `DATASET=visionarena|nemotron` selection or a mixed `DATASETS` list with one fraction per source.
+The exports emit the same prompt-only conversations, so everything downstream is shared: regeneration, then [`prepare_data.py`](prepare_data.md) like any other conversations JSONL. See `examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh` for VisionArena/Nemotron and `examples/train/dflash_qwen2_5_vl_7b_cauldron_online.sh` for the standalone Cauldron pipeline.
 
 ## Mixing VisionArena and Nemotron partitions
 
@@ -155,6 +156,23 @@ python scripts/export_nemotron_vlm.py \
 Downloads are resumable: an image already on disk is never refetched, so an interrupted run is continued by rerunning the same command, and raising `--fraction` fetches only the newly selected images. Each file is written under a temporary name and renamed, so an interrupted run cannot leave a truncated image that later looks complete.
 
 Expect a small number of permanent failures. OpenImages has removed keys over the years — about 3.4% of `vqa_1` returns 404 — so the usable row count is a few percent below nominal. These are reported rather than retried, and the export counts the rows it had to drop.
+
+## export_cauldron.py
+
+`HuggingFaceM4/the_cauldron` contains 50 subsets. Each source row may contain multiple images and multiple independent `texts` questions. The exporter writes each question as its own prompt conversation, drops the original assistant answer, and reuses content-addressed image files across those conversations.
+
+```bash
+python scripts/export_cauldron.py \
+  --dataset-path /data/the_cauldron \
+  --subsets chartqa,nlvr2,vqav2 \
+  --fraction 0.25 --seed 0 --resume \
+  --image-dir ./output/cauldron/images \
+  --outfile ./output/cauldron/prompts.jsonl
+```
+
+Local input uses `<subset>/*.parquet`. With no `--dataset-path`, the exporter requires an existing Hugging Face cache snapshot; `--allow-download` explicitly enables Hub streaming. An empty subset selection means all official subsets. `--fraction` is one deterministic nested row fraction for every selected subset.
+
+The pool manifest makes growth append-only: the same subsets and seed may increase the fraction, adding only new stable IDs, but may not decrease it. Use `MAX_SAMPLES` in `dflash_qwen2_5_vl_7b_cauldron_online.sh` to vary the training cap while retaining the larger regenerated pool. The script checks that the pool and successful generations satisfy the cap before preprocessing.
 
 ## regenerate_vlm_responses.py
 

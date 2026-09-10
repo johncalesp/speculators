@@ -49,6 +49,7 @@ regen = _load_script(
 download = _load_script(
     "download_nemotron_images", _SCRIPTS_DIR / "download_nemotron_images.py"
 )
+cauldron = _load_script("export_cauldron", _SCRIPTS_DIR / "export_cauldron.py")
 
 
 # A minimal but real PNG header, enough for suffix sniffing.
@@ -1457,3 +1458,119 @@ def test_fetch_one_writes_atomically_and_reports_a_404(tmp_path):
     ok, num_bytes, error = asyncio.run(run(_Response(404), gone))
     assert (ok, error) == (False, "404")
     assert not gone.exists()
+
+
+# ---------------------------------------------------------------------------
+# export_cauldron.py
+# ---------------------------------------------------------------------------
+
+
+def test_cauldron_splits_independent_questions_and_reuses_one_image(tmp_path):
+    row = {
+        "images": [{"bytes": _PNG, "path": "shared.png"}],
+        "texts": [
+            {"user": "First?", "assistant": "old answer", "source": "VQAv2"},
+            {"user": "Second?", "assistant": "another old answer", "source": "VQAv2"},
+        ],
+    }
+
+    rows = cauldron.build_rows(row, "vqav2", 7, tmp_path)
+
+    assert [item["conversation_id"] for item in rows] == [
+        "cauldron/vqav2/7/0",
+        "cauldron/vqav2/7/1",
+    ]
+    assert [item["conversations"][0]["content"][-1]["text"] for item in rows] == [
+        "First?",
+        "Second?",
+    ]
+    first_image = rows[0]["conversations"][0]["content"][0]["path"]
+    assert rows[1]["conversations"][0]["content"][0]["path"] == first_image
+    assert len(list(tmp_path.iterdir())) == 1
+    assert "old answer" not in json.dumps(rows)
+
+
+def test_cauldron_attaches_every_row_image_to_each_question(tmp_path):
+    row = {
+        "images": [
+            {"bytes": _PNG, "path": "one.png"},
+            {"bytes": _JPEG, "path": "two.jpg"},
+        ],
+        "texts": [{"user": "Compare them", "assistant": "unused", "source": "NLVR2"}],
+    }
+
+    rows = cauldron.build_rows(row, "nlvr2", 0, tmp_path)
+
+    parts = rows[0]["conversations"][0]["content"]
+    assert [part["type"] for part in parts] == ["image", "image", "text"]
+
+
+def test_cauldron_fraction_is_deterministic_and_nested(row_ids):
+    indices = range(len(row_ids))
+    small = {
+        index for index in indices if cauldron.keeps_row("vqav2", index, 0.1, 3)
+    }
+    large = {
+        index for index in indices if cauldron.keeps_row("vqav2", index, 0.5, 3)
+    }
+
+    assert small < large
+    assert small == {
+        index for index in indices if cauldron.keeps_row("vqav2", index, 0.1, 3)
+    }
+
+
+def test_cauldron_pool_can_grow_but_not_shrink(tmp_path):
+    manifest = tmp_path / "cauldron_pool.json"
+    outfile = tmp_path / "prompts.jsonl"
+    subsets = ["chart2text", "vqav2"]
+
+    cauldron.validate_pool_manifest(manifest, outfile, subsets, 0.25, 0)
+    cauldron.validate_pool_manifest(manifest, outfile, subsets, 0.5, 0)
+
+    with pytest.raises(ValueError, match="Cannot shrink PERC_SAMPLES"):
+        cauldron.validate_pool_manifest(manifest, outfile, subsets, 0.4, 0)
+
+
+def test_cauldron_pool_rejects_subset_identity_change(tmp_path):
+    manifest = tmp_path / "cauldron_pool.json"
+    outfile = tmp_path / "prompts.jsonl"
+    cauldron.validate_pool_manifest(manifest, outfile, ["vqav2"], 0.5, 0)
+
+    with pytest.raises(ValueError, match="identity changed"):
+        cauldron.validate_pool_manifest(
+            manifest, outfile, ["vqav2", "chartqa"], 0.5, 0
+        )
+
+
+def test_cauldron_empty_subset_list_means_all_official_subsets():
+    assert cauldron.parse_subsets("") == list(cauldron.CAULDRON_SUBSETS)
+
+
+def test_cauldron_pool_count_update_preserves_identity(tmp_path):
+    manifest = tmp_path / "cauldron_pool.json"
+    outfile = tmp_path / "prompts.jsonl"
+    cauldron.validate_pool_manifest(manifest, outfile, ["vqav2"], 0.25, 9)
+
+    cauldron.update_pool_count(manifest, 123)
+
+    contents = json.loads(manifest.read_text())
+    assert contents["conversation_count"] == 123
+    assert contents["subsets"] == ["vqav2"]
+    assert contents["fraction"] == 0.25
+    assert contents["seed"] == 9
+
+
+def test_cauldron_sample_cap_estimate_reports_required_increase():
+    message = cauldron.format_sample_cap_error(0.2, 400, 600)
+
+    assert "from 0.2 to an estimated minimum of 0.3" in message
+    assert "+0.1, 50.0% relative" in message
+
+
+def test_cauldron_sample_cap_estimate_reports_when_full_pool_is_too_small():
+    message = cauldron.format_sample_cap_error(0.25, 100, 500)
+
+    assert "PERC_SAMPLES=1" in message
+    assert "400 conversations" in message
+    assert "100% is insufficient" in message
