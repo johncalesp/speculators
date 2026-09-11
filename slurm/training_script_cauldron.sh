@@ -2,8 +2,6 @@
 #SBATCH --job-name=dflash2_qwen2_5_vl_7b_cauldron_online
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
-#SBATCH --gpus-per-node=4
-#SBATCH --cpus-per-task=32
 #SBATCH -p 36x2-a01r
 #SBATCH -A coreai_mlperf_inference
 #SBATCH -t 05:00:00
