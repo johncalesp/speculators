@@ -90,8 +90,13 @@ to the normal Slurm log.
 The editable installs use --no-deps, so the container must already contain the
 remaining Speculators dependencies (including pydantic-settings and PyYAML),
 PyTorch, Transformers, and a compatible vLLM with hidden-state extraction and
-the render endpoint. Git and access to package/build dependencies are needed
-for installation. Hugging Face offline mode does not disable pip networking.
+the render endpoint. Editable builds need access to their build dependencies;
+Git may also be needed for build-time version metadata. The pipeline's runtime
+provenance tolerates missing Git, failed Git commands, or a Git timeout: it logs
+a warning, records the reason in git_status.json and speculators.patch, and
+saves a source archive under provenance/source_snapshots/. Other provenance
+and source copies are still written. Hugging Face offline mode does not disable
+pip networking.
 The wrapper also exposes this checkout's src and hs_connectors/src on PYTHONPATH.
 
 HF_HOME defaults to /workspace/.cache. Hub and Datasets offline modes are
@@ -173,9 +178,13 @@ Do not increase WORK_SECONDS beyond 16200 or SAVE_GRACE_SECONDS beyond 1200
 within a five-hour allocation. Server startup has a 1200-second timeout,
 adjustable with SERVER_START_TIMEOUT.
 
-The resolved pipeline configuration and source digest are frozen on first use.
-Changing data, model snapshots, training settings, or source code requires a
-new OUTPUT_DIR (or restoring the original settings). This prevents resuming a
+The resolved pipeline configuration is frozen on first use. A source-only fix
+can refresh the fingerprint if no data or training work has started yet; the
+previous configuration is archived under provenance/config_revisions/ and the
+plan is rebuilt. This permits retrying a startup failure with the same OUTPUT_DIR.
+Once work exists, changing source code requires a new OUTPUT_DIR (or restoring
+the original source). Changes to data, model snapshots, or training settings
+always require a new OUTPUT_DIR or the original settings. This prevents resuming a
 checkpoint against different sample indices or a different learning-rate
 schedule. This recipe targets Qwen/Qwen2.5-VL-7B-Instruct specifically.
 

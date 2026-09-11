@@ -10,6 +10,7 @@ import shutil
 import signal
 import subprocess
 import sys
+import tarfile
 import time
 import urllib.error
 import urllib.request
@@ -30,19 +31,63 @@ def env_int(name, default, minimum=1):
     return value
 
 
+def source_paths():
+    return sorted(
+        [
+            *REPO.joinpath("src").rglob("*.py"),
+            *REPO.joinpath("hs_connectors/src").rglob("*.py"),
+            *REPO.joinpath("scripts").glob("*.py"),
+            *REPO.joinpath("slurm").glob("*.py"),
+            *REPO.joinpath("slurm").glob("*.sh"),
+        ]
+    )
+
+
 def source_digest():
     digest = hashlib.sha256()
-    paths = [
-        *REPO.joinpath("src").rglob("*.py"),
-        *REPO.joinpath("hs_connectors/src").rglob("*.py"),
-        *REPO.joinpath("scripts").glob("*.py"),
-        *REPO.joinpath("slurm").glob("*.py"),
-        *REPO.joinpath("slurm").glob("*.sh"),
-    ]
-    for path in sorted(paths):
+    for path in source_paths():
         digest.update(str(path.relative_to(REPO)).encode())
         digest.update(path.read_bytes())
     return digest.hexdigest()
+
+
+def has_pipeline_work(root):
+    if any(
+        (root / name).exists()
+        for name in ("prepared", "data_complete.json", "DONE.json")
+    ):
+        return True
+    return any(
+        directory.exists() and any(directory.iterdir())
+        for directory in (root / "chunks", root / "checkpoints")
+    )
+
+
+def save_pipeline_config(root, config):
+    path = root / "pipeline_config.json"
+    if path.exists():
+        previous = json.loads(path.read_text())
+        changed = [key for key in config if config[key] != previous.get(key)]
+        if changed == ["source_digest"] and not has_pipeline_work(root):
+            atomic_json(
+                root / "provenance/config_revisions" / f"{time.time_ns()}.json",
+                previous,
+            )
+            # Rebuild the plan if the updated source changes planning behavior.
+            (root / "plan.json").unlink(missing_ok=True)
+            print(
+                "Source updated before data/training started; "
+                "refreshing saved fingerprint.",
+                flush=True,
+            )
+        elif changed:
+            raise ValueError(
+                f"Run configuration changed: {changed}. "
+                "Restore it or use a new OUTPUT_DIR."
+            )
+        else:
+            return
+    atomic_json(path, config)
 
 
 def initialize(root):
@@ -83,17 +128,7 @@ def initialize(root):
         "checkpoint_steps": env_int("CHECKPOINT_STEPS", 200),
         "source_digest": source_digest(),
     }
-    path = root / "pipeline_config.json"
-    if path.exists():
-        previous = json.loads(path.read_text())
-        changed = [key for key in config if config[key] != previous.get(key)]
-        if changed:
-            raise ValueError(
-                f"Run configuration changed: {changed}. "
-                "Restore it or use a new OUTPUT_DIR."
-            )
-    else:
-        atomic_json(path, config)
+    save_pipeline_config(root, config)
     if not (root / "plan.json").exists():
         plan = make_plan(
             source, config["subsets"], config["max_samples"], config["chunk_size"]
@@ -136,14 +171,54 @@ class Allocation:
         shutil.copy(REPO / "slurm/training_script_cauldron.sh", self.provenance)
         for path in [*(REPO / "slurm").glob("*.py"), *(REPO / "slurm").glob("*.sh")]:
             shutil.copy(path, self.provenance)
-        patch = subprocess.run(
-            ["git", "diff", "HEAD", "--binary"],
-            cwd=REPO,
-            text=True,
-            capture_output=True,
-            check=True,
-        ).stdout
+        git_status = {"available": True}
+        try:
+            patch = subprocess.run(
+                ["git", "diff", "HEAD", "--binary"],
+                cwd=REPO,
+                text=True,
+                capture_output=True,
+                check=True,
+                timeout=30,
+            ).stdout
+        except (OSError, subprocess.SubprocessError) as error:
+            detail = getattr(error, "stderr", None) or str(error)
+            reason = " ".join(str(detail).split())[:2000]
+            snapshot = self.save_source_snapshot()
+            git_status = {
+                "available": False,
+                "error": reason,
+                "source_snapshot": str(snapshot.relative_to(self.root)),
+            }
+            patch = f"# Git diff unavailable: {reason}\n# Source snapshot: {snapshot}\n"
+            print(
+                f"Warning: Git provenance unavailable ({reason}); "
+                f"saved source snapshot to {snapshot}. Continuing.",
+                flush=True,
+            )
+        atomic_json(self.provenance / "git_status.json", git_status)
         (self.provenance / "speculators.patch").write_text(patch)
+
+    def save_source_snapshot(self):
+        directory = self.root / "provenance/source_snapshots"
+        directory.mkdir(parents=True, exist_ok=True)
+        snapshot = directory / f"{self.config['source_digest']}.tar.gz"
+        if not snapshot.exists():
+            temporary = snapshot.with_suffix(".tmp")
+            paths = source_paths() + [
+                REPO / "pyproject.toml",
+                REPO / "setup.py",
+                REPO / "hs_connectors/pyproject.toml",
+                REPO / "hs_connectors/setup.py",
+            ]
+            with tarfile.open(temporary, "w:gz", dereference=True) as archive:
+                for path in paths:
+                    if path.is_file():
+                        archive.add(
+                            path, arcname=str(path.relative_to(REPO)), recursive=False
+                        )
+            temporary.replace(snapshot)
+        return snapshot
 
     def spawn(self, command, name, gpus=None, extra_env=None):
         env = dict(os.environ)
