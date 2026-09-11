@@ -69,13 +69,30 @@ unfinished validation pass is not repeated.
 
 ## Cached data and environment
 
-The container's Python is used; the workstation's .venv is not activated.
-The wrapper exposes this checkout's src and hs_connectors/src on PYTHONPATH.
-The container must already contain the Speculators runtime dependencies
-(including datasets, pyarrow, pydantic-settings, PyYAML), PyTorch, Transformers,
-and a compatible vLLM with hidden-state extraction and the render endpoint.
-Prepare the container/environment before submitting the long run. PYTHON can
-select a different compatible interpreter inside the container.
+The container's python3 is used; the workstation's .venv is not activated.
+PYTHON can select a different compatible interpreter inside the container.
+On every allocation, the wrapper prints source hashes and the Python version,
+then runs:
+
+```bash
+python3 -m pip install 'datasets>=4.0.0,<=5.0.1'
+python3 -m pip install --no-deps -e ./hs_connectors -e .
+python3 -c 'import datasets, hs_connectors, speculators, speculators.train.data'
+```
+
+The selected interpreter is used for all three commands and the pipeline.
+PIP_CACHE_DIR defaults to $HF_HOME/pip so subsequent containers can reuse
+downloads and build artifacts. Installation time counts toward the allocation's
+work budget. Installation or preflight failures stop the job and continuation
+chain; the pipeline starts only after those checks pass. Startup output goes
+to the normal Slurm log.
+
+The editable installs use --no-deps, so the container must already contain the
+remaining Speculators dependencies (including pydantic-settings and PyYAML),
+PyTorch, Transformers, and a compatible vLLM with hidden-state extraction and
+the render endpoint. Git and access to package/build dependencies are needed
+for installation. Hugging Face offline mode does not disable pip networking.
+The wrapper also exposes this checkout's src and hs_connectors/src on PYTHONPATH.
 
 HF_HOME defaults to /workspace/.cache. Hub and Datasets offline modes are
 enabled: **both the complete target model and dataset must be cached**.
