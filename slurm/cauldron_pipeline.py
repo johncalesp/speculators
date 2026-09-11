@@ -266,6 +266,8 @@ class Allocation:
 
     def server_args(self, tp):
         cfg = self.config
+        # vLLM 0.28 disables request logging by default; the old
+        # --disable-log-requests flag is no longer accepted.
         return [
             "--host",
             "127.0.0.1",
@@ -287,7 +289,6 @@ class Allocation:
             json.dumps({"image": cfg["max_images"]}),
             "--mm-processor-kwargs",
             json.dumps({"max_pixels": cfg["max_pixels"]}),
-            "--disable-log-requests",
         ]
 
     def start_server(self, training):
