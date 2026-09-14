@@ -218,6 +218,23 @@ checkpoint and run the external LLaVA-Wild benchmark against each: lower
 Cauldron validation loss is useful for diagnosing training, but it does not
 guarantee the best out-of-domain speculative acceptance.
 
+### Five-hour Slurm allocations
+
+`slurm/training_script_cauldron.sh` automatically requeues itself ten minutes
+before its five-hour walltime. Its default `CHECKPOINT_FREQ=0.1` overwrites the
+current numeric epoch checkpoint every 10% of the epoch, including
+`training_state.json`; after requeue, training resumes at that batch instead of
+replaying the whole epoch. Export, regeneration, selection, and preparation are
+also restart-safe when `OUTPUT_DIR` is on persistent storage.
+
+The same Slurm job ID is retained and the container log is appended across
+restarts. A normal successful exit or a real pipeline failure is not requeued.
+`SAVE_BEST` must remain empty because it disables fractional checkpoints; the
+Slurm launcher rejects that combination. `checkpoint_best` is still maintained
+at completed validation epochs while numeric checkpoints are retained for
+external benchmarking. A site-level Slurm requeue limit can still stop the job;
+if `scontrol requeue` is denied, the batch log reports that failure explicitly.
+
 ## regenerate_vlm_responses.py
 
 Generates the target model's own responses for the exported prompts. Multi-turn conversations are regenerated sequentially, so each turn conditions on the model's own prior responses rather than the arena's, keeping the whole assistant history on-policy.

@@ -199,7 +199,7 @@ check_gpus() {
 }
 
 check_training_would_run() {
-    local last_epoch=-1 path name
+    local last_epoch=-1 path name local_step=0 state_path
     [[ -d "$CHECKPOINT_DIR" ]] || return 0
     for path in "$CHECKPOINT_DIR"/*; do
         name=$(basename "$path")
@@ -209,6 +209,23 @@ check_training_would_run() {
         fi
     done
     if (( last_epoch >= 0 && last_epoch + 1 >= EPOCHS )); then
+        state_path="$CHECKPOINT_DIR/$last_epoch/training_state.json"
+        if [[ -f "$state_path" ]]; then
+            local_step=$(python3 - "$state_path" <<'PY'
+import json
+import sys
+
+try:
+    print(int(json.load(open(sys.argv[1]))["local_step"]))
+except (OSError, KeyError, TypeError, ValueError, json.JSONDecodeError):
+    print(0)
+PY
+)
+        fi
+        if (( local_step > 0 )); then
+            echo "Resuming epoch $last_epoch from local step $local_step."
+            return 0
+        fi
         echo "Checkpoints already cover epoch $last_epoch; EPOCHS=$EPOCHS would do no work." >&2
         echo "Raise EPOCHS or use a fresh CHECKPOINT_DIR." >&2
         exit 1
