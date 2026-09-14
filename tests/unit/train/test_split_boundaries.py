@@ -90,3 +90,61 @@ def test_small_dataset_both_splits_nonempty(tmp_path):
     val = _split(path, 0.5, "val")
     assert len(train) == 1
     assert len(val) == 1
+
+
+def test_explicit_split_column_overrides_index_boundary(tmp_path):
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[i, i + 1] for i in range(4)],
+            "loss_mask": [[1, 1]] * 4,
+            "seq_len": [2] * 4,
+            "group_id": ["image-a", "image-b", "image-a", "image-c"],
+            "data_split": ["train", "val", "train", "val"],
+        }
+    )
+    path = tmp_path / "explicit"
+    ds.save_to_disk(str(path))
+    (path / "hidden_states").mkdir()
+
+    train = _split(str(path), 0.5, "train")
+    val = _split(str(path), 0.5, "val")
+
+    assert train.data["group_id"] == ["image-a", "image-a"]
+    assert val.data["group_id"] == ["image-b", "image-c"]
+    assert train._map_to_file_idx(0) == 0
+    assert train._map_to_file_idx(1) == 2
+    assert val._map_to_file_idx(0) == 1
+    assert val._map_to_file_idx(1) == 3
+
+
+def test_explicit_split_rejects_unknown_values(tmp_path):
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2], [3, 4]],
+            "loss_mask": [[1, 1], [1, 1]],
+            "seq_len": [2, 2],
+            "data_split": ["train", "test"],
+        }
+    )
+    path = tmp_path / "invalid-explicit"
+    ds.save_to_disk(str(path))
+
+    with pytest.raises(ValueError, match="unsupported values"):
+        _split(str(path), 0.9, "train")
+
+
+def test_explicit_split_rejects_group_leakage(tmp_path):
+    ds = Dataset.from_dict(
+        {
+            "input_ids": [[1, 2], [3, 4]],
+            "loss_mask": [[1, 1], [1, 1]],
+            "seq_len": [2, 2],
+            "group_id": ["same-image", "same-image"],
+            "data_split": ["train", "val"],
+        }
+    )
+    path = tmp_path / "leaked-explicit"
+    ds.save_to_disk(str(path))
+
+    with pytest.raises(ValueError, match="appears in both"):
+        _split(str(path), 0.9, "train")

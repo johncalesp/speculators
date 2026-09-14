@@ -7,6 +7,7 @@ These scripts build on-policy training data for a vision-language target model:
 | `export_visionarena.py`       | Turn a local VisionArena-Chat copy into prompt-only conversations plus images |
 | `export_nemotron_vlm.py`      | Same, for Llama-Nemotron-VLM-Dataset-v1, selected by partition and fraction   |
 | `export_cauldron.py`          | Export independently sampled Cauldron questions and materialize their images  |
+| `select_cauldron_data.py`     | Build balanced, image-disjoint Cauldron train and validation selections        |
 | `download_nemotron_images.py` | Fetches images for the Nemotron partitions that ship without them             |
 | `regenerate_vlm_responses.py` | Regenerate assistant responses with the target model, on-policy               |
 
@@ -173,6 +174,49 @@ python scripts/export_cauldron.py \
 Local input uses `<subset>/*.parquet`. With no `--dataset-path`, the exporter requires an existing Hugging Face cache snapshot; `--allow-download` explicitly enables Hub streaming. An empty subset selection means all official subsets. `--fraction` is one deterministic nested row fraction for every selected subset.
 
 The pool manifest makes growth append-only: the same subsets and seed may increase the fraction, adding only new stable IDs, but may not decrease it. Use `MAX_SAMPLES` in `dflash_qwen2_5_vl_7b_cauldron_online.sh` to vary the training cap while retaining the larger regenerated pool. The script checks that the pool and successful generations satisfy the cap before preprocessing.
+
+The standalone pipeline then runs `select_cauldron_data.py`. Its default
+`CAULDRON_PROFILE=llava_wild` keeps natural-image, open-ended, OCR, captioning,
+and comparison subsets while excluding the most specialized chart, table,
+medical, and synthetic subsets. `CAULDRON_TRAIN_SUBSETS` overrides that profile,
+and `CAULDRON_PROFILE=all` keeps every exported subset.
+
+Selection addresses two biases in the raw Cauldron pool:
+
+- `MAX_QUESTIONS_PER_IMAGE=1` prevents rows such as VQAv2 from contributing
+  several highly correlated questions about one image.
+- A capped `MAX_SAMPLES` is filled round-robin across available subsets rather
+  than being dominated by the largest subset.
+
+Images are content-addressed, so duplicate images found in different Cauldron
+subsets receive the same `group_id`. The deterministic `VAL_FRACTION=0.1`
+split assigns a complete image group to either train or validation. The
+prepared dataset preserves this explicit split, avoiding the previous leakage
+where sibling questions about one image could cross the index-based 90/10
+boundary.
+
+For a 250K full-vocabulary run aligned with four speculative tokens:
+
+```bash
+PERC_SAMPLES=1.0 \
+MAX_SAMPLES=250000 \
+CAULDRON_PROFILE=llava_wild \
+MAX_QUESTIONS_PER_IMAGE=1 \
+VAL_FRACTION=0.1 \
+BLOCK_SIZE=5 \
+DRAFT_VOCAB_SIZE=152064 \
+EPOCHS=10 \
+CHECKPOINT_FREQ=1 \
+OUTPUT_DIR=/data/dflash_cauldron_llava_wild \
+bash examples/train/dflash_qwen2_5_vl_7b_cauldron_online.sh
+```
+
+The regenerated `conversations.jsonl` remains the reusable superset.
+`selected_conversations.jsonl` and `prepared/` are derived and are rebuilt when
+profile, cap, split, or seed settings change. Keep every numeric epoch
+checkpoint and run the external LLaVA-Wild benchmark against each: lower
+Cauldron validation loss is useful for diagnosing training, but it does not
+guarantee the best out-of-domain speculative acceptance.
 
 ## regenerate_vlm_responses.py
 

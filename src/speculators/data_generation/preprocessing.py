@@ -28,6 +28,7 @@ __all__ = [
 log = PipelineLogger(__name__)
 
 _warned_roles: set[str] = set()
+_SPLIT_METADATA_COLUMNS = ("group_id", "subset", "data_split")
 
 ProcessorLike = PreTrainedTokenizerBase | ProcessorMixin
 
@@ -419,9 +420,14 @@ def _passthrough_pretokenized(
     these rows only need truncation and filtering.
     """
     results: dict[str, list] = {"input_ids": [], "loss_mask": [], "seq_len": []}
+    for column in _SPLIT_METADATA_COLUMNS:
+        if column in examples:
+            results[column] = []
     num_unsupervised = 0
     num_clipped = 0
-    for ids, mask in zip(examples["input_ids"], examples["loss_mask"], strict=True):
+    for idx, (ids, mask) in enumerate(
+        zip(examples["input_ids"], examples["loss_mask"], strict=True)
+    ):
         # A per-row length skew survives strict= column pairing; the collator
         # packs each key independently and would shift the mask silently.
         if len(ids) != len(mask):
@@ -434,6 +440,10 @@ def _passthrough_pretokenized(
         # Kept-but-truncated only: a row clipped past its boundary reports as
         # unsupervised above, and would otherwise be counted twice.
         num_clipped += status == "kept" and len(ids) > max_length
+        if status == "kept":
+            for column in _SPLIT_METADATA_COLUMNS:
+                if column in results:
+                    results[column].append(examples[column][idx])
     _warn_seq_length(num_unsupervised, num_clipped)
     return results
 
@@ -460,6 +470,9 @@ def _preprocess_batch(
 
     results: dict[str, list] = {"input_ids": [], "loss_mask": [], "seq_len": []}
     conversations: list[list[dict]] = examples.get("conversations", [])
+    for column in _SPLIT_METADATA_COLUMNS:
+        if column in examples:
+            results[column] = []
 
     # MM inputs are extracted via the Chat Completions API, which needs the
     # original messages -- token ids alone cannot carry the images.
@@ -505,6 +518,9 @@ def _preprocess_batch(
         num_unsupervised += row_unsupervised
         num_clipped += row_clipped
         num_convs_empty += num_kept == 0
+        for column in _SPLIT_METADATA_COLUMNS:
+            if column in results:
+                results[column].extend([examples[column][idx]] * num_kept)
 
     _warn_seq_length(num_unsupervised, num_clipped)
     if num_convs_empty:

@@ -50,6 +50,9 @@ download = _load_script(
     "download_nemotron_images", _SCRIPTS_DIR / "download_nemotron_images.py"
 )
 cauldron = _load_script("export_cauldron", _SCRIPTS_DIR / "export_cauldron.py")
+cauldron_select = _load_script(
+    "select_cauldron_data", _SCRIPTS_DIR / "select_cauldron_data.py"
+)
 
 
 # A minimal but real PNG header, enough for suffix sniffing.
@@ -454,12 +457,8 @@ def test_regeneration_can_read_the_nemotron_export(tmp_path):
 
 
 def test_visionarena_fraction_sampling_is_deterministic_and_nested(row_ids):
-    tenth = {
-        row_id for row_id in row_ids if export.keeps_row(row_id, 0.1, seed=17)
-    }
-    half = {
-        row_id for row_id in row_ids if export.keeps_row(row_id, 0.5, seed=17)
-    }
+    tenth = {row_id for row_id in row_ids if export.keeps_row(row_id, 0.1, seed=17)}
+    half = {row_id for row_id in row_ids if export.keeps_row(row_id, 0.5, seed=17)}
 
     assert tenth
     assert tenth < half
@@ -923,9 +922,7 @@ def test_regeneration_reduces_output_budget_to_fit_context():
     async def endpoint(payload):
         payloads.append(dict(payload))
         if len(payloads) == 1:
-            raise regen.ContextLengthError(
-                "too long", max_context=100, input_tokens=60
-            )
+            raise regen.ContextLengthError("too long", max_context=100, input_tokens=60)
         return _reply("fits")
 
     conversations, truncated = asyncio.run(
@@ -1507,12 +1504,8 @@ def test_cauldron_attaches_every_row_image_to_each_question(tmp_path):
 
 def test_cauldron_fraction_is_deterministic_and_nested(row_ids):
     indices = range(len(row_ids))
-    small = {
-        index for index in indices if cauldron.keeps_row("vqav2", index, 0.1, 3)
-    }
-    large = {
-        index for index in indices if cauldron.keeps_row("vqav2", index, 0.5, 3)
-    }
+    small = {index for index in indices if cauldron.keeps_row("vqav2", index, 0.1, 3)}
+    large = {index for index in indices if cauldron.keeps_row("vqav2", index, 0.5, 3)}
 
     assert small < large
     assert small == {
@@ -1538,9 +1531,7 @@ def test_cauldron_pool_rejects_subset_identity_change(tmp_path):
     cauldron.validate_pool_manifest(manifest, outfile, ["vqav2"], 0.5, 0)
 
     with pytest.raises(ValueError, match="identity changed"):
-        cauldron.validate_pool_manifest(
-            manifest, outfile, ["vqav2", "chartqa"], 0.5, 0
-        )
+        cauldron.validate_pool_manifest(manifest, outfile, ["vqav2", "chartqa"], 0.5, 0)
 
 
 def test_cauldron_empty_subset_list_means_all_official_subsets():
@@ -1559,6 +1550,118 @@ def test_cauldron_pool_count_update_preserves_identity(tmp_path):
     assert contents["subsets"] == ["vqav2"]
     assert contents["fraction"] == 0.25
     assert contents["seed"] == 9
+
+
+def _selected_cauldron_row(conversation_id, image):
+    return {
+        "conversation_id": conversation_id,
+        "conversations": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "image", "path": f"/images/{image}"},
+                    {"type": "text", "text": "Describe this image"},
+                ],
+            },
+            {"role": "assistant", "content": "A target-model response"},
+        ],
+    }
+
+
+def test_cauldron_selection_groups_duplicate_images_across_subsets():
+    first = _selected_cauldron_row("cauldron/vqav2/7/0", "same.png")
+    second = _selected_cauldron_row("cauldron/okvqa/99/0", "same.png")
+
+    assert cauldron_select.group_id_for(
+        first, "cauldron/vqav2/7"
+    ) == cauldron_select.group_id_for(second, "cauldron/okvqa/99")
+
+
+def test_cauldron_selection_caps_questions_and_balances_subsets(tmp_path):
+    source = tmp_path / "conversations.jsonl"
+    rows = [
+        _selected_cauldron_row("cauldron/vqav2/1/0", "one.png"),
+        _selected_cauldron_row("cauldron/vqav2/1/1", "one.png"),
+        _selected_cauldron_row("cauldron/vqav2/2/0", "two.png"),
+        _selected_cauldron_row("cauldron/vqav2/3/0", "three.png"),
+        _selected_cauldron_row("cauldron/okvqa/1/0", "four.png"),
+        _selected_cauldron_row("cauldron/okvqa/2/0", "five.png"),
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+
+    candidate_info, candidates, malformed = cauldron_select.load_candidates(
+        source,
+        {"vqav2", "okvqa"},
+        seed=3,
+        max_questions_per_image=1,
+    )
+
+    assert malformed == 0
+    assert len(candidate_info) == len(rows)
+    assert sum(map(len, candidates.values())) == 5
+    selected = cauldron_select.balanced_take(candidates, 4)
+    counts = {
+        subset: sum(f"/{subset}/" in conversation_id for conversation_id in selected)
+        for subset in ("vqav2", "okvqa")
+    }
+    assert counts == {"vqav2": 2, "okvqa": 2}
+
+
+def test_cauldron_selection_never_splits_one_image_group(tmp_path):
+    source = tmp_path / "conversations.jsonl"
+    rows = [
+        _selected_cauldron_row("cauldron/vqav2/1/0", "shared.png"),
+        _selected_cauldron_row("cauldron/vqav2/1/1", "shared.png"),
+    ]
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    candidate_info, candidates, _ = cauldron_select.load_candidates(
+        source,
+        {"vqav2"},
+        seed=0,
+        max_questions_per_image=2,
+    )
+
+    train, val = cauldron_select.partition_candidates(
+        candidate_info,
+        candidates,
+        seed=0,
+        val_fraction=0.5,
+    )
+
+    train_ids = {item[1] for values in train.values() for item in values}
+    val_ids = {item[1] for values in val.values() for item in values}
+    assert not (train_ids and val_ids)
+    assert train_ids | val_ids == {row["conversation_id"] for row in rows}
+
+
+def test_cauldron_selection_writes_explicit_disjoint_splits(tmp_path):
+    rows = [
+        _selected_cauldron_row("cauldron/vqav2/1/0", "train.png"),
+        _selected_cauldron_row("cauldron/okvqa/2/0", "val.png"),
+    ]
+    source = tmp_path / "conversations.jsonl"
+    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
+    outfile = tmp_path / "selected.jsonl"
+    candidate_info = {
+        row["conversation_id"]: (
+            row["conversation_id"].split("/")[1],
+            cauldron_select.group_id_for(row, row["conversation_id"].rsplit("/", 1)[0]),
+        )
+        for row in rows
+    }
+
+    cauldron_select.write_selection(
+        source,
+        candidate_info,
+        ["cauldron/vqav2/1/0"],
+        ["cauldron/okvqa/2/0"],
+        outfile,
+    )
+
+    selected = [json.loads(line) for line in outfile.read_text().splitlines()]
+    assert [row["data_split"] for row in selected] == ["train", "val"]
+    assert {row["subset"] for row in selected} == {"vqav2", "okvqa"}
+    assert selected[0]["group_id"] != selected[1]["group_id"]
 
 
 def test_cauldron_sample_cap_estimate_reports_required_increase():

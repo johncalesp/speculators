@@ -7,6 +7,9 @@
 # PERC_SAMPLES is one deterministic fraction applied to every subset. It may
 # grow in an existing OUTPUT_DIR, but cannot shrink; use MAX_SAMPLES to cap a
 # training run without discarding the reusable conversation pool.
+# After regeneration, CAULDRON_PROFILE selects a domain-aligned view, balances
+# capped samples across subsets, and keeps each content-addressed image wholly
+# in train or validation.
 
 set -euo pipefail
 unset VLLM_PORT VLLM_DP_SIZE
@@ -20,6 +23,10 @@ CAULDRON_ALLOW_DOWNLOAD="${CAULDRON_ALLOW_DOWNLOAD:-}"
 PERC_SAMPLES="${PERC_SAMPLES:-0.1}"
 EXPORT_SEED="${EXPORT_SEED:-0}"
 MAX_SAMPLES="${MAX_SAMPLES-5000}"
+CAULDRON_PROFILE="${CAULDRON_PROFILE:-llava_wild}"
+CAULDRON_TRAIN_SUBSETS="${CAULDRON_TRAIN_SUBSETS:-}"
+VAL_FRACTION="${VAL_FRACTION:-0.1}"
+MAX_QUESTIONS_PER_IMAGE="${MAX_QUESTIONS_PER_IMAGE:-1}"
 SEQ_LENGTH="${SEQ_LENGTH:-8192}"
 
 # Regeneration
@@ -33,12 +40,12 @@ LR="${LR:-3e-4}"
 CHECKPOINT_FREQ="${CHECKPOINT_FREQ:-1}"
 SAVE_BEST="${SAVE_BEST:-}"
 SPECULATOR_TYPE="${SPECULATOR_TYPE:-dflash}"
-BLOCK_SIZE="${BLOCK_SIZE:-16}"
+BLOCK_SIZE="${BLOCK_SIZE:-5}"
 MAX_ANCHORS="${MAX_ANCHORS:-3072}"
 NUM_LAYERS="${NUM_LAYERS:-5}"
 PER_POSITION_LOSS_WEIGHT="${PER_POSITION_LOSS_WEIGHT:-dpace}"
 LOSS_FN="${LOSS_FN:-ce}"
-DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
+DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-152064}"
 TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-2 14 25}"
 
 # Serving and GPU layout
@@ -57,6 +64,8 @@ NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-2}"
 IMAGE_DIR="$OUTPUT_DIR/images"
 PROMPTS_FILE="$OUTPUT_DIR/prompts.jsonl"
 CONVERSATIONS_FILE="$OUTPUT_DIR/conversations.jsonl"
+SELECTED_FILE="$OUTPUT_DIR/selected_conversations.jsonl"
+SELECTION_MANIFEST="$OUTPUT_DIR/selected_conversations.manifest.json"
 POOL_MANIFEST="$OUTPUT_DIR/cauldron_pool.json"
 DATA_DIR="$OUTPUT_DIR/prepared"
 PREPARE_STAMP="$OUTPUT_DIR/prepared.stamp"
@@ -92,6 +101,17 @@ check_config() {
     if [[ -n "$MAX_SAMPLES" ]] \
         && { ! [[ "$MAX_SAMPLES" =~ ^[0-9]+$ ]] || (( 10#$MAX_SAMPLES <= 0 )); }; then
         echo "MAX_SAMPLES=$MAX_SAMPLES is invalid; use a positive integer or empty." >&2
+        exit 1
+    fi
+    if ! [[ "$VAL_FRACTION" =~ ^([0-9]+([.][0-9]*)?|[.][0-9]+)$ ]] \
+        || ! awk -v value="$VAL_FRACTION" \
+            'BEGIN { exit !(value > 0 && value < 1) }'; then
+        echo "VAL_FRACTION=$VAL_FRACTION is invalid; use one value in (0, 1)." >&2
+        exit 1
+    fi
+    if ! [[ "$MAX_QUESTIONS_PER_IMAGE" =~ ^[0-9]+$ ]] \
+        || (( 10#$MAX_QUESTIONS_PER_IMAGE <= 0 )); then
+        echo "MAX_QUESTIONS_PER_IMAGE must be a positive integer." >&2
         exit 1
     fi
     if [[ -n "$CAULDRON_DATASET_PATH" && -n "$CAULDRON_ALLOW_DOWNLOAD" ]]; then
@@ -237,12 +257,17 @@ check_successful_cap() {
 
 prepare_signature() {
     local pool_count conversation_count manifest_hash="missing"
+    local selection_hash="missing" selected_count
     pool_count=$(line_count "$PROMPTS_FILE")
     conversation_count=$(line_count "$CONVERSATIONS_FILE")
+    selected_count=$(line_count "$SELECTED_FILE")
     if [[ -f "$POOL_MANIFEST" ]]; then
         manifest_hash=$(sha256sum "$POOL_MANIFEST" | awk '{print $1}')
     fi
-    echo "pool_manifest=$manifest_hash pool_count=$pool_count conversations=$conversation_count max_samples=${MAX_SAMPLES:-all} seq_length=$SEQ_LENGTH"
+    if [[ -f "$SELECTION_MANIFEST" ]]; then
+        selection_hash=$(sha256sum "$SELECTION_MANIFEST" | awk '{print $1}')
+    fi
+    echo "pool_manifest=$manifest_hash selection_manifest=$selection_hash pool_count=$pool_count conversations=$conversation_count selected=$selected_count max_samples=${MAX_SAMPLES:-all} seq_length=$SEQ_LENGTH seed=$EXPORT_SEED"
 }
 
 check_config
@@ -253,6 +278,8 @@ check_training_would_run
 echo "=== Configuration ==="
 echo "  model=$MODEL subsets=${CAULDRON_SUBSETS:-all 50}"
 echo "  perc_samples=$PERC_SAMPLES max_samples=${MAX_SAMPLES:-all} seed=$EXPORT_SEED"
+echo "  profile=$CAULDRON_PROFILE train_subsets=${CAULDRON_TRAIN_SUBSETS:-profile default}"
+echo "  val_fraction=$VAL_FRACTION max_questions_per_image=$MAX_QUESTIONS_PER_IMAGE"
 echo "  output_dir=$OUTPUT_DIR checkpoint_dir=$CHECKPOINT_DIR"
 
 # Step 1: deterministic append-only prompt pool export.
@@ -322,6 +349,24 @@ else
 fi
 check_successful_cap
 
+echo "=== Step 4b: Selecting balanced, image-disjoint train/validation data ==="
+SELECTION_ARGS=(
+    --data "$CONVERSATIONS_FILE"
+    --outfile "$SELECTED_FILE"
+    --manifest "$SELECTION_MANIFEST"
+    --profile "$CAULDRON_PROFILE"
+    --val-fraction "$VAL_FRACTION"
+    --max-questions-per-image "$MAX_QUESTIONS_PER_IMAGE"
+    --seed "$EXPORT_SEED"
+)
+if [[ -n "$CAULDRON_TRAIN_SUBSETS" ]]; then
+    SELECTION_ARGS+=(--subsets "$CAULDRON_TRAIN_SUBSETS")
+fi
+if [[ -n "$MAX_SAMPLES" ]]; then
+    SELECTION_ARGS+=(--max-samples "$MAX_SAMPLES")
+fi
+python3 scripts/select_cauldron_data.py "${SELECTION_ARGS[@]}"
+
 echo "=== Step 5: Launching hidden-state server ==="
 CUDA_VISIBLE_DEVICES="$EXTRACT_GPUS" python3 scripts/launch_vllm.py "$MODEL" \
     --target-layer-ids $TARGET_LAYER_IDS \
@@ -360,14 +405,12 @@ fi
 echo "=== Step 6: Preparing data ==="
 PREPARE_ARGS=(
     --model "$MODEL"
-    --data "$CONVERSATIONS_FILE"
+    --data "$SELECTED_FILE"
     --output "$DATA_DIR"
     --render-endpoint "http://localhost:${SERVER_PORT}"
     --seq-length "$SEQ_LENGTH"
+    --seed "$EXPORT_SEED"
 )
-if [[ -n "$MAX_SAMPLES" ]]; then
-    PREPARE_ARGS+=(--max-samples "$MAX_SAMPLES")
-fi
 python3 scripts/prepare_data.py "${PREPARE_ARGS[@]}"
 printf '%s\n' "$PREPARE_WANT" > "$PREPARE_STAMP"
 

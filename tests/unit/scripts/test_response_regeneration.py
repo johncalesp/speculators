@@ -219,6 +219,55 @@ def test_pretokenized_rows_pass_through_preprocessing():
     assert "conversations" not in out
 
 
+def test_pretokenized_rows_preserve_explicit_split_metadata():
+    out = _preprocess_batch(
+        {
+            "input_ids": [[1, 2, 3], [4, 5, 6]],
+            "loss_mask": [[0, 1, 1], [0, 0, 0]],
+            "group_id": ["image-a", "image-b"],
+            "subset": ["vqav2", "okvqa"],
+            "data_split": ["train", "val"],
+        },
+        is_multimodal=False,
+        max_length=16,
+        render_endpoint=None,
+    )
+
+    assert out["group_id"] == ["image-a"]
+    assert out["subset"] == ["vqav2"]
+    assert out["data_split"] == ["train"]
+
+
+def test_rendered_rows_duplicate_split_metadata_on_turn_fanout(monkeypatch):
+    def fake_render(conv, conv_tools, idx, render_endpoint, max_length):
+        del conv, conv_tools, render_endpoint, max_length
+        count = 2 if idx == 0 else 1
+        return [
+            {"input_ids": [idx, turn, 9], "loss_mask": [0, 1, 1], "conv": []}
+            for turn in range(count)
+        ]
+
+    monkeypatch.setattr(
+        "speculators.data_generation.preprocessing._render_conversation_rows",
+        fake_render,
+    )
+    out = _preprocess_batch(
+        {
+            "conversations": [["first"], ["second"]],
+            "group_id": ["image-a", "image-b"],
+            "subset": ["vqav2", "okvqa"],
+            "data_split": ["train", "val"],
+        },
+        is_multimodal=False,
+        max_length=16,
+        render_endpoint="http://unused",
+    )
+
+    assert out["group_id"] == ["image-a", "image-a", "image-b"]
+    assert out["subset"] == ["vqav2", "vqav2", "okvqa"]
+    assert out["data_split"] == ["train", "train", "val"]
+
+
 def test_pretokenized_passthrough_truncates_and_filters():
     # Truncation can cut the completion span away (all-zero mask); such a row must
     # be dropped by minimum_valid_tokens, like the tokenized path.

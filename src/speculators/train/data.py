@@ -161,24 +161,52 @@ class ArrowDataset(BaseDataset):
         max_retries: int = DEFAULT_MAX_RETRIES,
     ):
         self.data = load_from_disk(datapath)
+        self._file_indices: list[int] | None = None
         if not 0.0 < train_ratio <= 1.0:
             raise ValueError(f"train_ratio must be in (0.0, 1.0], got {train_ratio}")
-        if split == "val" and train_ratio == 1.0:
+        has_explicit_split = "data_split" in self.data.column_names
+        if split == "val" and train_ratio == 1.0 and not has_explicit_split:
             raise ValueError("train_ratio=1.0 leaves no validation split")
 
-        # Both splits derive their boundary from this one expression,
-        # so they are exactly complementary.
-        split_idx = int(len(self.data) * train_ratio)
-        start, stop = (
-            (0, split_idx) if split == "train" else (split_idx, len(self.data))
-        )
-        if start >= stop:
-            raise ValueError(
-                f"{split} split is empty (dataset has {len(self.data)} rows, "
-                f"train_ratio={train_ratio} gives split_idx={split_idx})"
+        if has_explicit_split:
+            values = self.data.with_format(None)["data_split"]
+            invalid = {value for value in values if value not in {"train", "val"}}
+            if invalid:
+                raise ValueError(
+                    "data_split contains unsupported values: "
+                    f"{sorted(map(repr, invalid))}; "
+                    "expected only 'train' and 'val'"
+                )
+            if "group_id" in self.data.column_names:
+                groups = self.data.with_format(None)["group_id"]
+                group_splits: dict[str, str] = {}
+                for group_id, assigned_split in zip(groups, values, strict=True):
+                    previous = group_splits.setdefault(group_id, assigned_split)
+                    if previous != assigned_split:
+                        raise ValueError(
+                            f"group_id {group_id!r} appears in both train and "
+                            "validation data_split values"
+                        )
+            indices = [index for index, value in enumerate(values) if value == split]
+            if not indices:
+                raise ValueError(f"{split} split is empty in data_split column")
+            self._file_indices = indices
+            self.start_file_idx = 0
+            self.data = self.data.select(indices)
+        else:
+            # Both splits derive their boundary from this one expression,
+            # so they are exactly complementary.
+            split_idx = int(len(self.data) * train_ratio)
+            start, stop = (
+                (0, split_idx) if split == "train" else (split_idx, len(self.data))
             )
-        self.start_file_idx = start
-        self.data = self.data.select(range(start, stop))
+            if start >= stop:
+                raise ValueError(
+                    f"{split} split is empty (dataset has {len(self.data)} rows, "
+                    f"train_ratio={train_ratio} gives split_idx={split_idx})"
+                )
+            self.start_file_idx = start
+            self.data = self.data.select(range(start, stop))
 
         self.transfer = transfer or FileTransfer(Path(datapath) / "hidden_states")
         self.vllm_endpoint = vllm_endpoint
@@ -193,6 +221,8 @@ class ArrowDataset(BaseDataset):
         super().__init__(max_len, transform, hidden_states_dtype)
 
     def _map_to_file_idx(self, index: int):
+        if self._file_indices is not None:
+            return self._file_indices[index]
         return index + self.start_file_idx
 
     def _setup_client(self):

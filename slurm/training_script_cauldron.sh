@@ -19,6 +19,10 @@ export CAULDRON_ALLOW_DOWNLOAD="${CAULDRON_ALLOW_DOWNLOAD:-}"
 export PERC_SAMPLES="${PERC_SAMPLES:-0.1}"
 export EXPORT_SEED="${EXPORT_SEED:-0}"
 export MAX_SAMPLES="${MAX_SAMPLES-5000}"
+export CAULDRON_PROFILE="${CAULDRON_PROFILE:-llava_wild}"
+export CAULDRON_TRAIN_SUBSETS="${CAULDRON_TRAIN_SUBSETS:-}"
+export VAL_FRACTION="${VAL_FRACTION:-0.1}"
+export MAX_QUESTIONS_PER_IMAGE="${MAX_QUESTIONS_PER_IMAGE:-1}"
 
 # Model, training, and checkpointing
 export MODEL="${MODEL:-Qwen/Qwen2.5-VL-7B-Instruct}"
@@ -29,12 +33,12 @@ export CHECKPOINT_FREQ="${CHECKPOINT_FREQ:-1}"
 export CHECKPOINT_DIR="${CHECKPOINT_DIR:-}"
 export SAVE_BEST="${SAVE_BEST:-}"
 export SPECULATOR_TYPE="${SPECULATOR_TYPE:-dflash}"
-export BLOCK_SIZE="${BLOCK_SIZE:-16}"
+export BLOCK_SIZE="${BLOCK_SIZE:-5}"
 export MAX_ANCHORS="${MAX_ANCHORS:-3072}"
 export NUM_LAYERS="${NUM_LAYERS:-5}"
 export PER_POSITION_LOSS_WEIGHT="${PER_POSITION_LOSS_WEIGHT:-dpace}"
 export LOSS_FN="${LOSS_FN:-ce}"
-export DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-32000}"
+export DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-152064}"
 export TARGET_LAYER_IDS="${TARGET_LAYER_IDS:-2 14 25}"
 
 # Regeneration and serving
@@ -63,14 +67,14 @@ export HF_TOKEN="${HF_TOKEN:-}"
 export VLLM_DISABLE_COMPILE_CACHE=1
 
 COMMENTS="${COMMENTS:-}"
-echo "Submitting: subsets=${CAULDRON_SUBSETS:-all} perc_samples=$PERC_SAMPLES max_samples=${MAX_SAMPLES:-all}"
+echo "Submitting: subsets=${CAULDRON_SUBSETS:-all} profile=$CAULDRON_PROFILE perc_samples=$PERC_SAMPLES max_samples=${MAX_SAMPLES:-all}"
 
 srun --container-image="${CONTAINER_IMAGE}" --container-mounts="${CONTAINER_MOUNTS}" \
     /bin/bash -c "
     set -uo pipefail
     cd ${WORK_DIR} || { echo 'WORK_DIR ${WORK_DIR} not found in container' >&2; exit 1; }
     echo '--- provenance ---'
-    sha1sum slurm/training_script_cauldron.sh examples/train/dflash_qwen2_5_vl_7b_cauldron_online.sh scripts/export_cauldron.py
+    sha1sum slurm/training_script_cauldron.sh examples/train/dflash_qwen2_5_vl_7b_cauldron_online.sh scripts/export_cauldron.py scripts/select_cauldron_data.py
     python3 -c 'import sys; print(sys.executable, sys.version.split()[0])'
     echo '------------------'
     unset VLLM_PORT VLLM_DP_SIZE
