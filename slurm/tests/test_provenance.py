@@ -100,4 +100,47 @@ def test_prework_retry_still_rejects_training_setting_changes(tmp_path):
         pipeline.save_pipeline_config(
             tmp_path, {"source_digest": "after", "epochs": 10}
         )
+
+
+def test_acknowledged_source_fix_preserves_existing_work(tmp_path, monkeypatch):
+    previous = {"source_digest": "before", "epochs": 5}
+    current = {"source_digest": "after", "epochs": 5}
+    atomic_json(tmp_path / "pipeline_config.json", previous)
+    plan = [{"id": "0000000"}]
+    atomic_json(tmp_path / "plan.json", plan)
+    artifacts = {
+        "chunks/0000000/complete.json": {"samples": 128},
+        "checkpoints/0/training_state.json": {"global_step": 200},
+    }
+    for name, contents in artifacts.items():
+        atomic_json(tmp_path / name, contents)
+    monkeypatch.setenv("CAULDRON_RESUME_SOURCE_FROM", "before")
+    pipeline.save_pipeline_config(tmp_path, current)
+    assert json.loads((tmp_path / "pipeline_config.json").read_text()) == current
+    assert json.loads((tmp_path / "plan.json").read_text()) == plan
+    for name, contents in artifacts.items():
+        assert json.loads((tmp_path / name).read_text()) == contents
+    archives = list((tmp_path / "provenance/config_revisions").glob("*.json"))
+    assert len(archives) == 1
+    assert json.loads(archives[0].read_text()) == previous
+    pipeline.save_pipeline_config(tmp_path, current)  # Continuation is idempotent.
+    assert len(list(archives[0].parent.glob("*.json"))) == 1
+    # The inherited acknowledgement cannot approve a subsequent source edit.
+    with pytest.raises(ValueError, match="source_digest"):
+        pipeline.save_pipeline_config(tmp_path, {**current, "source_digest": "later"})
+
+
+@pytest.mark.parametrize("acknowledgement", ["wrong", "", "before"])
+def test_source_acknowledgement_cannot_change_training_settings(
+    tmp_path, monkeypatch, acknowledgement
+):
+    previous = {"source_digest": "before", "epochs": 5}
+    atomic_json(tmp_path / "pipeline_config.json", previous)
+    atomic_json(tmp_path / "chunks/0000000/complete.json", {"samples": 128})
+    monkeypatch.setenv("CAULDRON_RESUME_SOURCE_FROM", acknowledgement)
+    with pytest.raises(ValueError, match="epochs"):
+        pipeline.save_pipeline_config(
+            tmp_path, {"source_digest": "after", "epochs": 10}
+        )
+    assert json.loads((tmp_path / "pipeline_config.json").read_text()) == previous
     assert json.loads((tmp_path / "pipeline_config.json").read_text()) == previous

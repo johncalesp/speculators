@@ -117,6 +117,17 @@ directories with their Parquet shards. Explicit CAULDRON_SUBSETS permits a
 partial download containing those subsets; "all" checks the dataset card's
 declared subset list and each subset's shard count.
 
+CLEVR-Math has an [upstream missing-image issue](https://huggingface.co/datasets/HuggingFaceM4/the_cauldron/discussions/3):
+its Parquet rows can contain paths such as /fsx/.../CLEVR_train_000000.png
+without embedded image bytes. The exporter recovers these images from the
+cached clevr subset in the **same snapshot**, matching the exact CLEVR filename.
+It does not assume that the two subsets have the same row order. If running
+only clevr_math, also cache clevr/*.parquet; a complete Cauldron snapshot already
+includes it. The filename index reads only Parquet path columns, and image
+reads retain at most one donor row group in memory. No network request is made
+during recovery. Missing filenames, missing donor bytes, and ambiguous matches
+fail with a diagnostic. Indexing and recovered-image counts appear in prepare.log.
+
 OUTPUT_DIR must be on the persistent mount, at the same container path in
 every allocation. It contains exported image files, conversations, regenerated
 responses, tokenized Arrow data, and checkpoints. Budget disk space for exported
@@ -182,9 +193,27 @@ The resolved pipeline configuration is frozen on first use. A source-only fix
 can refresh the fingerprint if no data or training work has started yet; the
 previous configuration is archived under provenance/config_revisions/ and the
 plan is rebuilt. This permits retrying a startup failure with the same OUTPUT_DIR.
-Once work exists, changing source code requires a new OUTPUT_DIR (or restoring
-the original source). Changes to data, model snapshots, or training settings
-always require a new OUTPUT_DIR or the original settings. This prevents resuming a
+Once work exists, source changes are rejected by default. For a reviewed,
+compatible fix, CAULDRON_RESUME_SOURCE_FROM can acknowledge the exact **previous**
+source_digest from OUTPUT_DIR/pipeline_config.json. The controller archives that
+configuration and retains the existing plan, completed chunks, journals, and
+checkpoints. An inherited acknowledgement cannot approve another source change
+after the fingerprint has been updated. This is appropriate for the CLEVR-Math
+image recovery fix, which leaves existing samples and training behavior intact:
+
+```bash
+# From the cluster repository root, after copying the updated
+# cauldron_data.py, cauldron_images.py, and cauldron_pipeline.py into slurm/.
+# This fingerprint is from the reported failed run; use your saved value
+# if a different source revision failed.
+CAULDRON_RESUME_SOURCE_FROM=46dd5c82db7d6d18529a98ad0e7c1075f744ca8752e21cbba1b1df6a5dcc4de0 \
+sbatch slurm/training_script_cauldron.sh
+```
+
+Use this acknowledgement only for changes verified compatible with the saved
+work. Otherwise use a new OUTPUT_DIR or restore the original source. Changes to
+data, model snapshots, or training settings always require a new OUTPUT_DIR or
+the original settings, even with an acknowledgement. This prevents resuming a
 checkpoint against different sample indices or a different learning-rate
 schedule. This recipe targets Qwen/Qwen2.5-VL-7B-Instruct specifically.
 

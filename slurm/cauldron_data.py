@@ -12,6 +12,7 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from cauldron_images import export_image
 from cauldron_state import append_journal, atomic_json, read_journal
 
 
@@ -111,23 +112,13 @@ def export_chunk(task: dict, root: Path) -> list[dict]:
     table = parquet.read_row_group(task["row_group"], columns=["images", "texts"])
     rows = table.slice(task["start"], task["count"]).to_pylist()
     conversations = []
+    recovered = 0
     for index, row in enumerate(rows):
         row_id = f"{task['id']}-{index:04d}"
         images = []
         for image_index, value in enumerate(row["images"]):
             image = directory / f"{row_id}-{image_index}.image"
-            if not image.exists():
-                temporary = image.with_suffix(".tmp")
-                if value.get("bytes") is not None:
-                    temporary.write_bytes(value["bytes"])
-                elif value.get("path"):
-                    original = Path(value["path"])
-                    if not original.is_absolute():
-                        original = Path(task["file"]).parent / original
-                    shutil.copyfile(original, temporary)
-                else:
-                    raise ValueError(f"{row_id}: image has neither bytes nor path")
-                temporary.replace(image)
+            recovered += export_image(value, image, task)
             images.append({"type": "image", "path": str(image.absolute())})
         turns = []
         for turn_index, turn in enumerate(row["texts"]):
@@ -151,6 +142,12 @@ def export_chunk(task: dict, root: Path) -> list[dict]:
             {"id": row_id, "conversations": turns, "num_images": len(images)}
         )
     atomic_json(exported, conversations)
+    if recovered:
+        print(
+            f"Chunk {task['id']}: recovered {recovered} CLEVR-Math images "
+            "from cached clevr Parquet bytes by filename",
+            flush=True,
+        )
     return conversations
 
 

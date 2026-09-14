@@ -68,18 +68,31 @@ def save_pipeline_config(root, config):
     if path.exists():
         previous = json.loads(path.read_text())
         changed = [key for key in config if config[key] != previous.get(key)]
-        if changed == ["source_digest"] and not has_pipeline_work(root):
+        has_work = has_pipeline_work(root)
+        acknowledged_source = os.environ.get("CAULDRON_RESUME_SOURCE_FROM")
+        compatible_update = bool(
+            acknowledged_source
+        ) and acknowledged_source == previous.get("source_digest")
+        if changed == ["source_digest"] and (not has_work or compatible_update):
             atomic_json(
                 root / "provenance/config_revisions" / f"{time.time_ns()}.json",
                 previous,
             )
-            # Rebuild the plan if the updated source changes planning behavior.
-            (root / "plan.json").unlink(missing_ok=True)
-            print(
-                "Source updated before data/training started; "
-                "refreshing saved fingerprint.",
-                flush=True,
-            )
+            if has_work:
+                print(
+                    "Applying acknowledged compatible source update: "
+                    f"{previous['source_digest']} -> {config['source_digest']}. "
+                    "Keeping the existing plan, chunks, and checkpoints.",
+                    flush=True,
+                )
+            else:
+                # No sample indices are in use yet, so planning can be rebuilt.
+                (root / "plan.json").unlink(missing_ok=True)
+                print(
+                    "Source updated before data/training started; "
+                    "refreshing saved fingerprint.",
+                    flush=True,
+                )
         elif changed:
             raise ValueError(
                 f"Run configuration changed: {changed}. "
