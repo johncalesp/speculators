@@ -202,13 +202,22 @@ after the fingerprint has been updated. This is appropriate for the CLEVR-Math
 image recovery fix, which leaves existing samples and training behavior intact:
 
 ```bash
-# From the cluster repository root, after copying the updated
-# cauldron_data.py, cauldron_images.py, and cauldron_pipeline.py into slurm/.
-# This fingerprint is from the reported failed run; use your saved value
-# if a different source revision failed.
-CAULDRON_RESUME_SOURCE_FROM=46dd5c82db7d6d18529a98ad0e7c1075f744ca8752e21cbba1b1df6a5dcc4de0 \
-sbatch slurm/training_script_cauldron.sh
+# From the cluster repository root, after copying the updated pipeline files
+# (including cauldron_images.py and training_script_cauldron.sh) into slurm/.
+# This is the default output's HOST path; adjust it if OUTPUT_DIR was customized.
+run_config=../output/dflash2_qwen2_5_vl_7b_cauldron/pipeline_config.json
+CAULDRON_RESUME_SOURCE_FROM="$(
+    python3 -c 'import json, sys; print(json.load(open(sys.argv[1]))["source_digest"])' "$run_config"
+)" &&
+export CAULDRON_RESUME_SOURCE_FROM &&
+sbatch --export=ALL slurm/training_script_cauldron.sh
 ```
+
+Read the fingerprint from the saved configuration for each reviewed update;
+a value copied from an older job log can be stale. The batch log prints the
+submitted value, and the script passes it explicitly into the container. A
+source mismatch reports the saved fingerprint, current fingerprint, and value
+received inside the container, including <unset> if it was not supplied.
 
 Use this acknowledgement only for changes verified compatible with the saved
 work. Otherwise use a new OUTPUT_DIR or restore the original source. Changes to

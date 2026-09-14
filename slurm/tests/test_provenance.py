@@ -102,6 +102,32 @@ def test_prework_retry_still_rejects_training_setting_changes(tmp_path):
         )
 
 
+@pytest.mark.parametrize("acknowledgement", [None, "older-fingerprint"])
+def test_source_mismatch_reports_saved_current_and_received_fingerprints(
+    tmp_path, monkeypatch, acknowledgement
+):
+    previous = {"source_digest": "saved-fingerprint", "epochs": 5}
+    current = {"source_digest": "current-fingerprint", "epochs": 5}
+    atomic_json(tmp_path / "pipeline_config.json", previous)
+    atomic_json(tmp_path / "chunks/0000000/complete.json", {"samples": 128})
+    if acknowledgement is None:
+        monkeypatch.delenv("CAULDRON_RESUME_SOURCE_FROM", raising=False)
+    else:
+        monkeypatch.setenv("CAULDRON_RESUME_SOURCE_FROM", acknowledgement)
+    with pytest.raises(ValueError, match="source_digest") as error:
+        pipeline.save_pipeline_config(tmp_path, current)
+    message = str(error.value)
+    assert "Saved source_digest: saved-fingerprint" in message
+    assert "Current source_digest: current-fingerprint" in message
+    assert f"received in container: {acknowledgement or '<unset>'}" in message
+    assert str(tmp_path / "pipeline_config.json") in message
+    assert "sbatch --export=ALL" in message
+    assert json.loads((tmp_path / "pipeline_config.json").read_text()) == previous
+    assert json.loads((tmp_path / "chunks/0000000/complete.json").read_text()) == {
+        "samples": 128
+    }
+
+
 def test_acknowledged_source_fix_preserves_existing_work(tmp_path, monkeypatch):
     previous = {"source_digest": "before", "epochs": 5}
     current = {"source_digest": "after", "epochs": 5}

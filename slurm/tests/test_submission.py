@@ -57,6 +57,62 @@ def test_batch_submission_only_chains_continuations(
         assert "Continuation job: 9002" in result.stdout
 
 
+@pytest.mark.parametrize("acknowledgement", ["a" * 64, ""])
+def test_resume_fingerprint_reaches_container_and_successor(tmp_path, acknowledgement):
+    binary = tmp_path / "bin"
+    binary.mkdir()
+    (tmp_path / "slurm").mkdir()
+    worker = tmp_path / "slurm/run_cauldron.sh"
+    worker.write_text(
+        '#!/bin/bash\nprintf "%s" "$CAULDRON_RESUME_SOURCE_FROM" '
+        '> "$TEST_WORKER_FINGERPRINT"\nexit 75\n'
+    )
+    for name, contents in {
+        "srun": (
+            f"#!{sys.executable}\n"
+            "import os, subprocess, sys\n"
+            "env = dict(os.environ)\n"
+            # Simulate a container that did not inherit the variable.
+            "env.pop('CAULDRON_RESUME_SOURCE_FROM', None)\n"
+            "command = sys.argv[sys.argv.index('env'):]\n"
+            "sys.exit(subprocess.run(command, env=env).returncode)\n"
+        ),
+        "sbatch": (
+            '#!/bin/bash\nprintf "%s" "$CAULDRON_RESUME_SOURCE_FROM" '
+            '> "$TEST_SUCCESSOR_FINGERPRINT"\necho 9002\n'
+        ),
+    }.items():
+        path = binary / name
+        path.write_text(contents)
+        path.chmod(0o755)
+    env = dict(os.environ)
+    env.update(
+        {
+            "PATH": f"{binary}:{env['PATH']}",
+            "CAULDRON_RESUME_SOURCE_FROM": acknowledgement,
+            "TEST_WORKER_FINGERPRINT": str(tmp_path / "worker_fingerprint"),
+            "TEST_SUCCESSOR_FINGERPRINT": str(tmp_path / "successor_fingerprint"),
+            "AUTO_CONTINUE": "1",
+            "SLURM_JOB_ID": "9001",
+            "SLURM_SUBMIT_DIR": str(REPO),
+            "SLURM_JOB_PARTITION": "test-partition",
+            "SLURM_JOB_ACCOUNT": "test-account",
+        }
+    )
+    result = subprocess.run(  # noqa: S603 - fake Slurm and container worker
+        ["/bin/bash", str(REPO / "slurm/training_script_cauldron.sh")],
+        env=env,
+        cwd=tmp_path,
+        text=True,
+        capture_output=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert (tmp_path / "worker_fingerprint").read_text() == acknowledgement
+    assert (tmp_path / "successor_fingerprint").read_text() == acknowledgement
+    assert f"Resume source fingerprint: {acknowledgement or '<unset>'}" in result.stdout
+
+
 @pytest.mark.parametrize("failure", [None, "datasets", "editable", "preflight"])
 def test_container_bootstrap_installs_before_pipeline(tmp_path, failure):
     interpreter = tmp_path / "python3"

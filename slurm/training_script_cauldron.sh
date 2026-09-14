@@ -20,6 +20,7 @@ export VLLM_DISABLE_COMPILE_CACHE=1
 export EPOCHS="${EPOCHS:-5}"
 export CAULDRON_SUBSETS="${CAULDRON_SUBSETS:-all}"
 export MAX_SAMPLES="${MAX_SAMPLES:-0}"
+export CAULDRON_RESUME_SOURCE_FROM="${CAULDRON_RESUME_SOURCE_FROM:-}"
 # Include container startup; reserve 30 minutes for checkpointing and cleanup.
 if (( ${WORK_SECONDS:-16200} < 1 || ${WORK_SECONDS:-16200} > 16200 || ${SAVE_GRACE_SECONDS:-1200} > 1200 )); then
     echo "WORK_SECONDS must be 1..16200 and SAVE_GRACE_SECONDS <= 1200" >&2
@@ -29,12 +30,14 @@ export CAULDRON_DEADLINE=$(( $(date +%s) + ${WORK_SECONDS:-16200} ))
 export SLURM_EXPORT_ENV=ALL
 export PIPELINE_SBATCH_SCRIPT="${PIPELINE_SBATCH_SCRIPT:-${SLURM_SUBMIT_DIR:?}/slurm/training_script_cauldron.sh}"
 test -f "$PIPELINE_SBATCH_SCRIPT"
+echo "Resume source fingerprint: ${CAULDRON_RESUME_SOURCE_FROM:-<unset>}"
 
 set +e
 srun --ntasks=1 --kill-on-bad-exit=1 \
     --container-image="$CONTAINER_IMAGE" \
     --container-mounts="$CONTAINER_MOUNTS" \
     --container-workdir="$WORK_DIR" \
+    env CAULDRON_RESUME_SOURCE_FROM="$CAULDRON_RESUME_SOURCE_FROM" \
     bash slurm/run_cauldron.sh
 rc=$?
 set -e

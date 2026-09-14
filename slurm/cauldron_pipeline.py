@@ -94,6 +94,20 @@ def save_pipeline_config(root, config):
                     flush=True,
                 )
         elif changed:
+            if changed == ["source_digest"]:
+                raise ValueError(
+                    f"Run configuration changed: {changed}.\n"
+                    f"Saved configuration: {path}\n"
+                    f"Saved source_digest: {previous.get('source_digest')}\n"
+                    f"Current source_digest: {config['source_digest']}\n"
+                    "CAULDRON_RESUME_SOURCE_FROM received in container: "
+                    f"{acknowledged_source or '<unset>'}\n"
+                    "For a verified compatible fix, export "
+                    "CAULDRON_RESUME_SOURCE_FROM with the saved source_digest "
+                    "and submit with sbatch --export=ALL. "
+                    "Otherwise restore the source or use a new OUTPUT_DIR. "
+                    "The saved configuration and completed work were not changed."
+                )
             raise ValueError(
                 f"Run configuration changed: {changed}. "
                 "Restore it or use a new OUTPUT_DIR."
