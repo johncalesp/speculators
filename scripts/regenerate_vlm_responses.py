@@ -444,8 +444,16 @@ async def worker(
                 post,
                 item["turns"],
                 model=args.model,
-                max_tokens=args.max_tokens,
-                sampling_params=args.sampling_params,
+                max_tokens=min(
+                    args.max_tokens,
+                    item.get("generation_params", {}).get(
+                        "max_tokens", args.max_tokens
+                    ),
+                ),
+                sampling_params={
+                    **item.get("generation_params", {}),
+                    **args.sampling_params,
+                },
             )
             row = {
                 "conversation_id": item["conversation_id"],
@@ -523,7 +531,10 @@ def build_work_items(rows: list[dict], completed: set[str]) -> list[dict]:
                 )
             num_missing_images += 1
             continue
-        items.append({"conversation_id": conversation_id, "turns": turns})
+        item = {"conversation_id": conversation_id, "turns": turns}
+        if "generation_params" in row:
+            item["generation_params"] = row["generation_params"]
+        items.append(item)
 
     if num_missing_images:
         logger.warning(

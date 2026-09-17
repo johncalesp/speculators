@@ -19,7 +19,6 @@ import importlib.util
 import io
 import json
 import struct
-import tarfile
 import zlib
 from pathlib import Path
 from typing import Any
@@ -42,19 +41,9 @@ def _load_script(name: str, path: Path):
 
 
 export = _load_script("export_visionarena", _SCRIPTS_DIR / "export_visionarena.py")
-nemotron = _load_script("export_nemotron_vlm", _SCRIPTS_DIR / "export_nemotron_vlm.py")
 regen = _load_script(
     "regenerate_vlm_responses", _SCRIPTS_DIR / "regenerate_vlm_responses.py"
 )
-download = _load_script(
-    "download_nemotron_images", _SCRIPTS_DIR / "download_nemotron_images.py"
-)
-cauldron = _load_script("export_cauldron", _SCRIPTS_DIR / "export_cauldron.py")
-cauldron_select = _load_script(
-    "select_cauldron_data", _SCRIPTS_DIR / "select_cauldron_data.py"
-)
-
-
 # A minimal but real PNG header, enough for suffix sniffing.
 _PNG = b"\x89PNG\r\n\x1a\n" + b"pixels"
 _JPEG = b"\xff\xd8\xff" + b"pixels"
@@ -374,303 +363,6 @@ def test_resolve_dataset_dir_rejects_a_missing_explicit_path(tmp_path):
 
 def test_resolve_dataset_dir_uses_an_explicit_path_verbatim(tmp_path):
     assert export.resolve_dataset_dir(tmp_path) == tmp_path
-
-
-# ---------------------------------------------------------------------------
-# export_nemotron_vlm.py: row shape
-# ---------------------------------------------------------------------------
-
-# nvidia/Llama-Nemotron-VLM-Dataset-v1: one image per row, a single human/gpt
-# exchange, and an <image> placeholder marking the image's place in the prompt.
-_NEMOTRON_ROW: dict[str, Any] = {
-    "id": "22935085-3b90-4348-a4b1-6985ec7da67e",
-    "image": "502450.png",
-    "conversations": [
-        {"from": "human", "value": "<image>\nExtract all visible text."},
-        {"from": "gpt", "value": "<dataset response to drop>"},
-    ],
-}
-
-
-def test_build_row_converts_a_real_nemotron_row(tmp_path):
-    row = nemotron.build_row(_NEMOTRON_ROW, "ocr_1", tmp_path / "502450.png")
-
-    assert row is not None
-    assert row["conversation_id"] == "ocr_1/22935085-3b90-4348-a4b1-6985ec7da67e"
-    # The gpt turn is off-policy and must not survive into the export.
-    assert [turn["role"] for turn in row["conversations"]] == ["user"]
-    assert row["conversations"][0]["content"] == [
-        {"type": "image", "path": str(tmp_path / "502450.png")},
-        {"type": "text", "text": "Extract all visible text."},
-    ]
-
-
-def test_prompt_parts_keeps_the_placeholder_position(tmp_path):
-    """A mid-prompt placeholder must not be hoisted to the front."""
-    parts = nemotron.prompt_parts("Compare <image> with the table.", tmp_path / "i.png")
-
-    assert [part["type"] for part in parts] == ["text", "image", "text"]
-    assert parts[0]["text"] == "Compare"
-    assert parts[2]["text"] == "with the table."
-
-
-def test_build_row_rejects_a_prompt_that_is_only_an_image():
-    row = dict(_NEMOTRON_ROW)
-    row["conversations"] = [{"from": "human", "value": "<image>"}]
-
-    assert nemotron.build_row(row, "ocr_1", Path("/x/i.png")) is None
-
-
-def test_build_row_rejects_a_row_with_no_user_turn():
-    row = dict(_NEMOTRON_ROW)
-    row["conversations"] = [{"from": "gpt", "value": "answer"}]
-
-    assert nemotron.build_row(row, "ocr_1", Path("/x/i.png")) is None
-
-
-def test_nemotron_export_is_accepted_by_prepare_data(tmp_path):
-    """The handoff: what this export writes, prepare_data.py has to accept."""
-    row = nemotron.build_row(_NEMOTRON_ROW, "ocr_1", tmp_path / "502450.png")
-    assert row is not None
-    # Regeneration appends the on-policy answer; that is what gets prepared.
-    conversations = [*row["conversations"], {"role": "assistant", "content": "text"}]
-
-    adapted = _adapt_conv_for_vllm(conversations)
-
-    assert [part["type"] for part in adapted[0]["content"]] == ["image_url", "text"]
-    assert adapted[0]["content"][0]["image_url"]["url"].startswith("file://")
-
-
-def test_regeneration_can_read_the_nemotron_export(tmp_path):
-    row = nemotron.build_row(_NEMOTRON_ROW, "ocr_1", tmp_path / "502450.png")
-    assert row is not None
-
-    turns = regen.prompt_turns(row)
-
-    assert [turn["role"] for turn in turns] == ["user"]
-    assert turns[0]["content"][0]["type"] == "image"
-
-
-# ---------------------------------------------------------------------------
-# export_nemotron_vlm.py: fraction sampling
-# ---------------------------------------------------------------------------
-
-
-def test_visionarena_fraction_sampling_is_deterministic_and_nested(row_ids):
-    tenth = {row_id for row_id in row_ids if export.keeps_row(row_id, 0.1, seed=17)}
-    half = {row_id for row_id in row_ids if export.keeps_row(row_id, 0.5, seed=17)}
-
-    assert tenth
-    assert tenth < half
-    assert tenth == {
-        row_id for row_id in row_ids if export.keeps_row(row_id, 0.1, seed=17)
-    }
-
-
-def test_visionarena_fraction_sampling_uses_its_own_namespace(row_ids):
-    visionarena_ids = {
-        row_id for row_id in row_ids if export.keeps_row(row_id, 0.1, seed=0)
-    }
-    nemotron_ids = {
-        row_id
-        for row_id in row_ids
-        if nemotron.keeps_row("visionarena", row_id, 0.1, seed=0)
-    }
-
-    assert visionarena_ids == nemotron_ids
-
-
-def _kept(fraction: float, ids: list[str], partition: str = "ocr_1") -> set[str]:
-    return {i for i in ids if nemotron.keeps_row(partition, i, fraction, seed=0)}
-
-
-@pytest.fixture
-def row_ids() -> list[str]:
-    return [f"{i:08d}-uuid" for i in range(20_000)]
-
-
-@pytest.mark.parametrize("fraction", [0.01, 0.1, 0.5])
-def test_keeps_row_selects_about_the_requested_fraction(row_ids, fraction):
-    kept = _kept(fraction, row_ids)
-
-    # Binomial noise at n=20k is well inside 15% relative at these fractions.
-    assert kept
-    assert abs(len(kept) / len(row_ids) - fraction) < 0.15 * fraction
-
-
-def test_keeps_row_is_nested_so_raising_the_fraction_only_adds(row_ids):
-    """The property that makes topping up cheap: no row already exported is lost.
-
-    A shuffle-and-slice sample would pick a different subset when the fraction
-    changes, discarding the images the previous run extracted.
-    """
-    tenth = _kept(0.1, row_ids)
-    fifth = _kept(0.2, row_ids)
-
-    assert tenth < fifth
-
-
-def test_keeps_row_is_deterministic(row_ids):
-    assert _kept(0.1, row_ids) == _kept(0.1, row_ids)
-
-
-def test_keeps_row_differs_between_partitions(row_ids):
-    """Partitions must not share a selection pattern."""
-    assert _kept(0.1, row_ids, "ocr_1") != _kept(0.1, row_ids, "ocr_4")
-
-
-def test_keeps_row_keeps_everything_at_fraction_one(row_ids):
-    assert _kept(1.0, row_ids) == set(row_ids)
-
-
-# ---------------------------------------------------------------------------
-# export_nemotron_vlm.py: image naming and partition selection
-# ---------------------------------------------------------------------------
-
-
-def test_destination_name_flattens_nested_member_names():
-    name = nemotron.destination_name("data/train/project-26/0000160/99833.md.jpg")
-
-    assert name == "data__train__project-26__0000160__99833.md.jpg"
-    assert Path(name).name == name
-
-
-@pytest.mark.parametrize(
-    "member", ["../../etc/passwd", "/etc/passwd", "..", "a/../../b", ""]
-)
-def test_destination_name_cannot_escape_the_image_dir(member):
-    """Member names come from the archive, so they must not choose the path."""
-    name = nemotron.destination_name(member)
-
-    assert Path(name).name == name
-    assert ".." not in Path(name).parts
-    assert (Path("/images") / name).resolve().parent == Path("/images")
-
-
-def test_destination_name_shortens_an_overlong_name():
-    name = nemotron.destination_name("x/" * 400 + "img.png")
-
-    assert len(name) <= 200
-    assert Path(name).name == name
-
-
-def _make_partition(
-    directory: Path, name: str, rows: list[dict], *, with_images: bool
-) -> None:
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / f"{name}.jsonl").write_text(
-        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
-    )
-    if with_images:
-        image_dir = directory / f"{name}_images"
-        image_dir.mkdir(exist_ok=True)
-        with tarfile.open(image_dir / "shard_000001.tar", "w") as archive:
-            for row in rows:
-                info = tarfile.TarInfo(row["image"])
-                info.size = len(_PNG)
-                archive.addfile(info, io.BytesIO(_PNG))
-
-
-@pytest.fixture
-def nemotron_dir(tmp_path) -> Path:
-    rows = [dict(_NEMOTRON_ROW, id=f"id{i}", image=f"{i}.png") for i in range(4)]
-    _make_partition(tmp_path, "ocr_1", rows, with_images=True)
-    _make_partition(tmp_path, "vqa_1", rows, with_images=False)
-    return tmp_path
-
-
-def test_select_partitions_defaults_to_those_with_images(nemotron_dir):
-    chosen = nemotron.select_partitions(nemotron_dir, None)
-
-    assert [part["name"] for part in chosen] == ["ocr_1"]
-
-
-def test_select_partitions_rejects_a_partition_without_images(nemotron_dir):
-    """Exporting one would emit prompts pointing at files that do not exist."""
-    with pytest.raises(ValueError, match="have no images"):
-        nemotron.select_partitions(nemotron_dir, "ocr_1,vqa_1")
-
-
-def test_select_partitions_rejects_an_unknown_partition(nemotron_dir):
-    with pytest.raises(ValueError, match="Unknown partition"):
-        nemotron.select_partitions(nemotron_dir, "ocr_99")
-
-
-def test_select_partitions_keeps_the_requested_order(nemotron_dir):
-    rows = [dict(_NEMOTRON_ROW, id="a", image="a.png")]
-    _make_partition(nemotron_dir, "ocr_4", rows, with_images=True)
-
-    chosen = nemotron.select_partitions(nemotron_dir, "ocr_4,ocr_1")
-
-    assert [part["name"] for part in chosen] == ["ocr_4", "ocr_1"]
-
-
-def test_count_rows_prefers_the_sidecar_index(tmp_path):
-    """The dataset ships uint64 offsets per row plus a terminator."""
-    partition = tmp_path / "ocr_1.jsonl"
-    partition.write_text('{"a": 1}\n', encoding="utf-8")
-    # Claims 7 rows, which only the index could report.
-    partition.with_suffix(".jsonl.idx").write_bytes(b"\x00" * 8 * 8)
-
-    assert nemotron.count_rows(partition) == 7
-
-
-def test_count_rows_falls_back_to_counting_lines(tmp_path):
-    partition = tmp_path / "ocr_1.jsonl"
-    partition.write_text('{"a": 1}\n{"a": 2}\n{"a": 3}\n', encoding="utf-8")
-
-    assert nemotron.count_rows(partition) == 3
-
-
-def test_export_partition_extracts_only_the_selected_images(nemotron_dir, tmp_path):
-    """End to end over a real TAR: selection, extraction and row writing."""
-    partition = nemotron.select_partitions(nemotron_dir, "ocr_1")[0]
-    wanted = nemotron.select_rows(partition, fraction=1.0, seed=0, exported_ids={"x"})
-    # Keep two of the four images to prove the others are left in the archive.
-    wanted = dict(list(wanted.items())[:2])
-
-    outfile = tmp_path / "out" / "prompts.jsonl"
-    outfile.parent.mkdir()
-    image_root = tmp_path / "images"
-    with outfile.open("w", encoding="utf-8") as handle:
-        written, skipped, missing = nemotron.export_partition(
-            partition, wanted, image_root, handle, tqdm_stub()
-        )
-
-    assert (written, skipped, missing) == (2, 0, 0)
-    assert sorted(p.name for p in (image_root / "ocr_1").iterdir()) == sorted(wanted)
-    rows = [json.loads(line) for line in outfile.read_text().splitlines()]
-    assert len(rows) == 2
-    for row in rows:
-        image = row["conversations"][0]["content"][0]
-        assert Path(image["path"]).is_file()
-
-
-def test_export_partition_reports_images_missing_from_the_archive(
-    nemotron_dir, tmp_path
-):
-    """An incomplete download must be counted, not silently exported."""
-    partition = nemotron.select_partitions(nemotron_dir, "ocr_1")[0]
-    wanted = {"absent.png": [dict(_NEMOTRON_ROW, image="absent.png")]}
-
-    outfile = tmp_path / "prompts.jsonl"
-    with outfile.open("w", encoding="utf-8") as handle:
-        written, _, missing = nemotron.export_partition(
-            partition, wanted, tmp_path / "images", handle, tqdm_stub()
-        )
-
-    assert (written, missing) == (0, 1)
-    assert outfile.read_text() == ""
-
-
-def test_select_rows_skips_ids_already_exported(nemotron_dir):
-    partition = nemotron.select_partitions(nemotron_dir, "ocr_1")[0]
-
-    all_rows = nemotron.select_rows(partition, 1.0, 0, set())
-    minus_one = nemotron.select_rows(partition, 1.0, 0, {"ocr_1/id0"})
-
-    assert sum(map(len, all_rows.values())) == 4
-    assert sum(map(len, minus_one.values())) == 3
 
 
 # ---------------------------------------------------------------------------
@@ -1162,518 +854,162 @@ def test_prepare_data_would_reject_the_wire_form(tmp_path):
         _adapt_conv_for_vllm(wire)
 
 
-# ---------------------------------------------------------------------------
-# download_nemotron_images.py + the loose-image export path
-#
-# The partitions whose images the repo does not ship (vqa_1 and friends) get
-# them from OpenImages instead, as plain files rather than TAR shards. The
-# assertions that matter here are the agreement ones: the downloader has to
-# choose exactly the rows the export will later ask for, or a run downloads one
-# subset and exports another.
-# ---------------------------------------------------------------------------
+requests_export = _load_script(
+    "export_vlm_requests", _SCRIPTS_DIR / "export_vlm_requests.py"
+)
 
 
-def _make_loose_partition(
-    directory: Path, name: str, rows: list[dict], present: list[str]
-) -> None:
-    """A partition whose images are plain files, only some of them present."""
-    directory.mkdir(parents=True, exist_ok=True)
-    (directory / f"{name}.jsonl").write_text(
-        "".join(json.dumps(r) + "\n" for r in rows), encoding="utf-8"
+def _attribute_request():
+    return json.loads(
+        (_SCRIPTS_DIR.parent / "examples/data/vlm_attribute_request.json").read_text()
     )
-    image_dir = directory / f"{name}_images"
-    image_dir.mkdir(exist_ok=True)
-    for image in present:
-        (image_dir / image).write_bytes(_JPEG)
 
 
-def test_the_two_scripts_agree_on_which_partitions_are_downloadable():
-    """The export names them only to suggest the downloader; a drift misleads."""
-    assert set(download.IMAGE_SOURCES) == nemotron._DOWNLOADABLE
+def test_customer_request_preserves_system_images_and_sampling(tmp_path):
+    request = _attribute_request()
+    row = requests_export.convert_request(request, tmp_path, tmp_path / "images")
+    assert row["conversations"][0] == request["messages"][0]
+    assert row["generation_params"] == {
+        "temperature": 0.1,
+        "max_tokens": 2000,
+        "logit_bias": {str(i): -100 for i in range(151652, 151656)},
+    }
+    assert "data:image" not in json.dumps(row)
+    wire = _adapt_conv_for_vllm(row["conversations"])
+    image_url = wire[1]["content"][1]["image_url"]["url"]
+    assert image_url.startswith("file:///")
+    assert Path(row["conversations"][1]["content"][1]["path"]).is_file()
 
 
-def test_download_and_export_select_the_same_rows(tmp_path):
-    """The point of sharing keeps_row: one subset, not two."""
-    rows = [dict(_NEMOTRON_ROW, id=f"id{i}", image=f"{i}.jpg") for i in range(400)]
-    _make_loose_partition(tmp_path, "vqa_1", rows, present=[])
-
-    to_download = download.wanted_images(tmp_path, "vqa_1", fraction=0.25, seed=0)
-
-    # What the export would ask for, over the same rows and fraction.
-    partition = {"name": "vqa_1", "path": tmp_path / "vqa_1.jsonl"}
-    to_export = set(nemotron.select_rows(partition, 0.25, 0, set()))
-
-    assert to_download == to_export
-    assert 0 < len(to_download) < len(rows)
+def test_customer_request_deduplicates_base64_and_local_images(tmp_path):
+    request = _attribute_request()
+    first = requests_export.convert_request(request, tmp_path, tmp_path / "images")
+    image_path = first["conversations"][1]["content"][1]["path"]
+    request["messages"][1]["content"][1]["image_url"]["url"] = image_path
+    second = requests_export.convert_request(request, tmp_path, tmp_path / "images")
+    assert first == second
+    assert len(list((tmp_path / "images").iterdir())) == 1
 
 
-def test_download_selection_is_nested_so_raising_the_fraction_only_adds(tmp_path):
-    """Why a top-up refetches nothing: the smaller selection is a subset."""
-    rows = [dict(_NEMOTRON_ROW, id=f"id{i}", image=f"{i}.jpg") for i in range(400)]
-    _make_loose_partition(tmp_path, "vqa_1", rows, present=[])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "https://example.com/a.png",
+        "data:image/png;base64,%%%",
+        "data:text/plain;base64,eA==",
+        "data:image/png;base64,eA==",
+    ],
+)
+def test_customer_request_rejects_invalid_images(tmp_path, url):
+    request = _attribute_request()
+    request["messages"][1]["content"][1]["image_url"]["url"] = url
+    with pytest.raises(ValueError):
+        requests_export.convert_request(request, tmp_path, tmp_path / "images")
 
-    small = download.wanted_images(tmp_path, "vqa_1", fraction=0.1, seed=0)
-    large = download.wanted_images(tmp_path, "vqa_1", fraction=0.3, seed=0)
 
+def test_customer_request_changed_content_changes_resume_id(tmp_path):
+    request = _attribute_request()
+    request["id"] = "product-1"
+    first = requests_export.convert_request(request, tmp_path, tmp_path / "images")
+    request["temperature"] = 0.2
+    second = requests_export.convert_request(request, tmp_path, tmp_path / "images")
+    assert first["conversation_id"] != second["conversation_id"]
+
+
+def test_customer_request_drops_original_assistant_history(tmp_path):
+    request = _attribute_request()
+    request["messages"] += [
+        {"role": "assistant", "content": "off-policy"},
+        {"role": "user", "content": "Explain the color."},
+    ]
+    row = requests_export.convert_request(request, tmp_path, tmp_path / "images")
+    assert [turn["role"] for turn in row["conversations"]] == ["system", "user", "user"]
+    assert "off-policy" not in json.dumps(row)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("tools", []), ("response_format", {"type": "json_object"}), ("max_tokens", 0)],
+)
+def test_customer_request_rejects_unsupported_settings(tmp_path, field, value):
+    request = _attribute_request()
+    request[field] = value
+    with pytest.raises(ValueError):
+        requests_export.convert_request(request, tmp_path, tmp_path / "images")
+
+
+def test_customer_export_streams_thousands_and_reruns_without_duplicates(tmp_path):
+    request = _attribute_request()
+    source = tmp_path / "requests.jsonl"
+    output = tmp_path / "prompts.jsonl"
+    with source.open("w") as handle:
+        for index in range(2000):
+            handle.write(json.dumps(request | {"id": index}) + "\n")
+    for _ in range(2):
+        assert (
+            requests_export.export_requests([source], output, tmp_path / "images")
+            == 2000
+        )
+    rows = [json.loads(line) for line in output.read_text().splitlines()]
+    assert len({row["conversation_id"] for row in rows}) == 2000
+    assert len(list((tmp_path / "images").iterdir())) == 1
+
+
+def test_customer_export_failure_keeps_previous_output(tmp_path):
+    source = tmp_path / "bad.jsonl"
+    source.write_text(json.dumps(_attribute_request()) + '\n{"messages": invalid}\n')
+    output = tmp_path / "prompts.jsonl"
+    output.write_text("previous export\n")
+    with pytest.raises(ValueError, match="bad.jsonl:2"):
+        requests_export.export_requests([source], output, tmp_path / "images")
+    assert output.read_text() == "previous export\n"
+    assert not output.with_suffix(".jsonl.tmp").exists()
+
+
+def test_customer_generation_parameters_reach_worker(tmp_path, monkeypatch):
+    row = requests_export.convert_request(
+        _attribute_request(), tmp_path, tmp_path / "images"
+    )
+    items = regen.build_work_items([row], set())
+    sent = []
+
+    async def post(_session, _endpoint, payload, **kwargs):
+        sent.append(payload)
+        return _reply('{"Color":"red"}')
+
+    monkeypatch.setattr(regen, "post_chat", post)
+
+    async def scenario():
+        queue = asyncio.Queue()
+        await queue.put(items[0])
+        await queue.put(None)
+        stats = {
+            "ok": 0,
+            "errors": 0,
+            "truncated": 0,
+            "requests": 0,
+            "total_request_s": 0,
+        }
+        args = _Args()
+        args.sampling_params = {"temperature": 0.0}
+        await regen.worker(
+            None, queue, args, io.StringIO(), io.StringIO(), _NullProgress(), stats
+        )
+        assert stats["ok"] == 1
+
+    asyncio.run(scenario())
+    assert sent[0]["temperature"] == 0.0  # CLI overrides per-record settings.
+    assert sent[0]["logit_bias"] == row["generation_params"]["logit_bias"]
+    assert sent[0]["max_tokens"] == 64  # CLI budget caps the request's 2000.
+    assert sent[0]["messages"][0]["role"] == "system"
+    assert sent[0]["messages"][1]["content"][1]["image_url"]["url"].startswith(
+        "file://"
+    )
+
+
+def test_visionarena_fraction_sampling_is_nested():
+    ids = [f"row-{index}" for index in range(1000)]
+    small = {row for row in ids if export.keeps_row(row, 0.1, 3)}
+    large = {row for row in ids if export.keeps_row(row, 0.5, 3)}
     assert small < large
-
-
-def test_download_deduplicates_images_shared_by_several_rows(tmp_path):
-    """captioning_2 asks several questions about one image; fetch it once."""
-    rows = [dict(_NEMOTRON_ROW, id=f"id{i}", image="same.jpg") for i in range(20)]
-    _make_loose_partition(tmp_path, "vqa_1", rows, present=[])
-
-    assert download.wanted_images(tmp_path, "vqa_1", 1.0, 0) == {"same.jpg"}
-
-
-def test_already_present_is_what_makes_a_download_resumable(tmp_path):
-    rows = [dict(_NEMOTRON_ROW, id=f"id{i}", image=f"{i}.jpg") for i in range(4)]
-    _make_loose_partition(tmp_path, "vqa_1", rows, present=["0.jpg", "2.jpg"])
-
-    names = download.wanted_images(tmp_path, "vqa_1", 1.0, 0)
-    present = download.already_present(tmp_path / "vqa_1_images", names)
-
-    assert present == {"0.jpg", "2.jpg"}
-    assert names - present == {"1.jpg", "3.jpg"}
-
-
-def test_downloader_rejects_a_partition_with_no_derivable_urls(tmp_path):
-    """ChartQA and friends have to be fetched by hand; say so rather than 404."""
-    _make_loose_partition(tmp_path, "vqa_4", [], present=[])
-
-    with pytest.raises(ValueError, match="do not have derivable image URLs"):
-        download.select_partitions(tmp_path, "vqa_4")
-
-
-def test_downloader_rejects_a_partition_with_no_local_metadata(tmp_path):
-    with pytest.raises(FileNotFoundError, match="No JSONL for partition"):
-        download.select_partitions(tmp_path, "vqa_1")
-
-
-def test_loose_images_make_a_shipped_imageless_partition_exportable(tmp_path):
-    """The whole reason for the download: vqa_1 becomes usable."""
-    rows = [dict(_NEMOTRON_ROW, id=f"id{i}", image=f"{i}.jpg") for i in range(3)]
-    _make_loose_partition(tmp_path, "vqa_1", rows, present=["0.jpg", "1.jpg", "2.jpg"])
-
-    chosen = nemotron.select_partitions(tmp_path, "vqa_1")
-
-    assert len(chosen) == 1
-    assert chosen[0]["has_images"] is True
-    assert chosen[0]["shards"] == []
-    assert chosen[0]["loose_dir"] == tmp_path / "vqa_1_images"
-
-
-def test_export_references_downloaded_images_in_place(tmp_path):
-    """Copying them would be a second copy of a selection that reaches 378 GB."""
-    rows = [dict(_NEMOTRON_ROW, id=f"id{i}", image=f"{i}.jpg") for i in range(2)]
-    _make_loose_partition(tmp_path, "vqa_1", rows, present=["0.jpg", "1.jpg"])
-    partition = nemotron.select_partitions(tmp_path, "vqa_1")[0]
-    wanted = nemotron.select_rows(partition, 1.0, 0, set())
-
-    image_root = tmp_path / "export_images"
-    outfile = tmp_path / "prompts.jsonl"
-    with outfile.open("w", encoding="utf-8") as handle:
-        written, skipped, missing = nemotron.export_partition(
-            partition, wanted, image_root, handle, tqdm_stub()
-        )
-
-    assert (written, skipped, missing) == (2, 0, 0)
-    assert not image_root.exists()
-    for line in outfile.read_text().splitlines():
-        image = json.loads(line)["conversations"][0]["content"][0]
-        assert Path(image["path"]).parent == tmp_path / "vqa_1_images"
-        assert Path(image["path"]).is_file()
-
-
-def test_export_counts_rows_whose_download_404ed(tmp_path):
-    """OpenImages has removed keys over time; those rows must not be emitted."""
-    rows = [dict(_NEMOTRON_ROW, id=f"id{i}", image=f"{i}.jpg") for i in range(3)]
-    _make_loose_partition(tmp_path, "vqa_1", rows, present=["0.jpg", "2.jpg"])
-    partition = nemotron.select_partitions(tmp_path, "vqa_1")[0]
-    wanted = nemotron.select_rows(partition, 1.0, 0, set())
-
-    outfile = tmp_path / "prompts.jsonl"
-    with outfile.open("w", encoding="utf-8") as handle:
-        written, _, missing = nemotron.export_partition(
-            partition, wanted, tmp_path / "images", handle, tqdm_stub()
-        )
-
-    assert (written, missing) == (2, 1)
-
-
-def test_a_loose_image_name_cannot_escape_its_directory(tmp_path):
-    """The image field comes from the dataset, so it is confined before use."""
-    secret = tmp_path / "secret.jpg"
-    secret.write_bytes(_JPEG)
-    rows = [dict(_NEMOTRON_ROW, id="id0", image="../secret.jpg")]
-    _make_loose_partition(tmp_path, "vqa_1", rows, present=["decoy.jpg"])
-    partition = nemotron.select_partitions(tmp_path, "vqa_1")[0]
-    wanted = nemotron.select_rows(partition, 1.0, 0, set())
-
-    outfile = tmp_path / "prompts.jsonl"
-    with outfile.open("w", encoding="utf-8") as handle:
-        written, _, missing = nemotron.export_partition(
-            partition, wanted, tmp_path / "images", handle, tqdm_stub()
-        )
-
-    assert (written, missing) == (0, 1)
-    assert outfile.read_text() == ""
-
-
-def test_image_source_adds_a_location_without_hiding_the_shipped_tars(tmp_path):
-    """Treating it as an override would lose the tar-shipped partitions."""
-    dataset_dir = tmp_path / "dataset"
-    rows = [dict(_NEMOTRON_ROW, id=f"id{i}", image=f"{i}.png") for i in range(2)]
-    _make_partition(dataset_dir, "ocr_1", rows, with_images=True)
-    _make_partition(dataset_dir, "vqa_1", rows, with_images=False)
-
-    # vqa_1's images were downloaded somewhere else entirely.
-    elsewhere = tmp_path / "downloaded"
-    elsewhere.mkdir()
-    (elsewhere / "vqa_1_images").mkdir()
-    for row in rows:
-        (elsewhere / "vqa_1_images" / row["image"]).write_bytes(_JPEG)
-
-    found = {
-        part["name"]: part
-        for part in nemotron.discover_partitions(dataset_dir, elsewhere)
-    }
-
-    assert found["ocr_1"]["has_images"] is True
-    assert found["ocr_1"]["shards"], "the shipped tars must still be found"
-    assert found["vqa_1"]["has_images"] is True
-    assert found["vqa_1"]["loose_dir"] == elsewhere / "vqa_1_images"
-
-
-def test_a_directory_of_only_tars_is_not_mistaken_for_loose_images(tmp_path):
-    rows = [dict(_NEMOTRON_ROW, id="id0", image="0.png")]
-    _make_partition(tmp_path, "ocr_1", rows, with_images=True)
-
-    assert nemotron.loose_image_dir(tmp_path, "ocr_1") is None
-
-
-def test_a_partial_download_does_not_count_as_a_loose_image(tmp_path):
-    """An interrupted fetch leaves .partial files; they are not images yet."""
-    (tmp_path / "vqa_1_images").mkdir()
-    (tmp_path / "vqa_1_images" / "0.jpg.partial").write_bytes(_JPEG)
-
-    assert nemotron.loose_image_dir(tmp_path, "vqa_1") is None
-
-
-def test_nested_chartqa_tree_counts_as_loose_images_through_symlink(tmp_path):
-    chartqa = tmp_path / "ChartQA Dataset"
-    image = chartqa / "train" / "png" / "chart.png"
-    image.parent.mkdir(parents=True)
-    image.write_bytes(_JPEG)
-    partition_dir = tmp_path / "vqa_4_images"
-    partition_dir.mkdir()
-    (partition_dir / "chartqa").symlink_to(chartqa, target_is_directory=True)
-
-    assert nemotron.loose_image_dir(tmp_path, "vqa_4") == partition_dir
-    assert (partition_dir / "chartqa/train/png/chart.png").resolve() == image
-
-
-def test_vqa4_export_accepts_image_below_explicit_chartqa_symlink(tmp_path):
-    chartqa = tmp_path / "ChartQA Dataset"
-    image = chartqa / "train" / "png" / "chart.png"
-    image.parent.mkdir(parents=True)
-    image.write_bytes(_JPEG)
-    partition_dir = tmp_path / "vqa_4_images"
-    partition_dir.mkdir()
-    (partition_dir / "chartqa").symlink_to(chartqa, target_is_directory=True)
-    row = dict(
-        _NEMOTRON_ROW,
-        id="chart-id",
-        image="chartqa/train/png/chart.png",
-    )
-    partition = {"name": "vqa_4", "loose_dir": partition_dir}
-    outfile = tmp_path / "prompts.jsonl"
-
-    with outfile.open("w", encoding="utf-8") as handle:
-        written, skipped, missing = nemotron.export_loose_partition(
-            partition,
-            {row["image"]: [row]},
-            handle,
-            tqdm_stub(),
-        )
-
-    assert (written, skipped, missing) == (1, 0, 0)
-
-
-def test_an_imageless_downloadable_partition_is_told_how_to_get_its_images(tmp_path):
-    rows = [dict(_NEMOTRON_ROW, id="id0", image="0.png")]
-    _make_partition(tmp_path, "vqa_1", rows, with_images=False)
-
-    with pytest.raises(ValueError, match="download_nemotron_images.py"):
-        nemotron.select_partitions(tmp_path, "vqa_1")
-
-
-def test_fetch_one_writes_atomically_and_reports_a_404(tmp_path):
-    """A removed key must not fail a run of a million, nor leave a stub file."""
-
-    class _Response:
-        def __init__(self, status: int, payload: bytes = b"") -> None:
-            self.status = status
-            self._payload = payload
-
-        async def __aenter__(self):
-            return self
-
-        async def __aexit__(self, *_):
-            return False
-
-        def raise_for_status(self) -> None:
-            if self.status >= 400:
-                raise RuntimeError(self.status)
-
-        async def read(self) -> bytes:
-            return self._payload
-
-    class _Session:
-        def __init__(self, response: _Response) -> None:
-            self._response = response
-
-        def get(self, _url):
-            return self._response
-
-    async def run(response, destination):
-        return await download.fetch_one(
-            _Session(response),
-            "https://example.invalid/x.jpg",
-            destination,
-            asyncio.Semaphore(1),
-            max_retries=2,
-        )
-
-    good = tmp_path / "good.jpg"
-    ok, num_bytes, error = asyncio.run(run(_Response(200, _JPEG), good))
-    assert (ok, num_bytes, error) == (True, len(_JPEG), None)
-    assert good.read_bytes() == _JPEG
-    assert not list(tmp_path.glob("*.partial"))
-
-    gone = tmp_path / "gone.jpg"
-    ok, num_bytes, error = asyncio.run(run(_Response(404), gone))
-    assert (ok, error) == (False, "404")
-    assert not gone.exists()
-
-
-# ---------------------------------------------------------------------------
-# export_cauldron.py
-# ---------------------------------------------------------------------------
-
-
-def test_cauldron_splits_independent_questions_and_reuses_one_image(tmp_path):
-    row = {
-        "images": [{"bytes": _PNG, "path": "shared.png"}],
-        "texts": [
-            {"user": "First?", "assistant": "old answer", "source": "VQAv2"},
-            {"user": "Second?", "assistant": "another old answer", "source": "VQAv2"},
-        ],
-    }
-
-    rows = cauldron.build_rows(row, "vqav2", 7, tmp_path)
-
-    assert [item["conversation_id"] for item in rows] == [
-        "cauldron/vqav2/7/0",
-        "cauldron/vqav2/7/1",
-    ]
-    assert [item["conversations"][0]["content"][-1]["text"] for item in rows] == [
-        "First?",
-        "Second?",
-    ]
-    first_image = rows[0]["conversations"][0]["content"][0]["path"]
-    assert rows[1]["conversations"][0]["content"][0]["path"] == first_image
-    assert len(list(tmp_path.iterdir())) == 1
-    assert "old answer" not in json.dumps(rows)
-
-
-def test_cauldron_attaches_every_row_image_to_each_question(tmp_path):
-    row = {
-        "images": [
-            {"bytes": _PNG, "path": "one.png"},
-            {"bytes": _JPEG, "path": "two.jpg"},
-        ],
-        "texts": [{"user": "Compare them", "assistant": "unused", "source": "NLVR2"}],
-    }
-
-    rows = cauldron.build_rows(row, "nlvr2", 0, tmp_path)
-
-    parts = rows[0]["conversations"][0]["content"]
-    assert [part["type"] for part in parts] == ["image", "image", "text"]
-
-
-def test_cauldron_fraction_is_deterministic_and_nested(row_ids):
-    indices = range(len(row_ids))
-    small = {index for index in indices if cauldron.keeps_row("vqav2", index, 0.1, 3)}
-    large = {index for index in indices if cauldron.keeps_row("vqav2", index, 0.5, 3)}
-
-    assert small < large
-    assert small == {
-        index for index in indices if cauldron.keeps_row("vqav2", index, 0.1, 3)
-    }
-
-
-def test_cauldron_pool_can_grow_but_not_shrink(tmp_path):
-    manifest = tmp_path / "cauldron_pool.json"
-    outfile = tmp_path / "prompts.jsonl"
-    subsets = ["chart2text", "vqav2"]
-
-    cauldron.validate_pool_manifest(manifest, outfile, subsets, 0.25, 0)
-    cauldron.validate_pool_manifest(manifest, outfile, subsets, 0.5, 0)
-
-    with pytest.raises(ValueError, match="Cannot shrink PERC_SAMPLES"):
-        cauldron.validate_pool_manifest(manifest, outfile, subsets, 0.4, 0)
-
-
-def test_cauldron_pool_rejects_subset_identity_change(tmp_path):
-    manifest = tmp_path / "cauldron_pool.json"
-    outfile = tmp_path / "prompts.jsonl"
-    cauldron.validate_pool_manifest(manifest, outfile, ["vqav2"], 0.5, 0)
-
-    with pytest.raises(ValueError, match="identity changed"):
-        cauldron.validate_pool_manifest(manifest, outfile, ["vqav2", "chartqa"], 0.5, 0)
-
-
-def test_cauldron_empty_subset_list_means_all_official_subsets():
-    assert cauldron.parse_subsets("") == list(cauldron.CAULDRON_SUBSETS)
-
-
-def test_cauldron_pool_count_update_preserves_identity(tmp_path):
-    manifest = tmp_path / "cauldron_pool.json"
-    outfile = tmp_path / "prompts.jsonl"
-    cauldron.validate_pool_manifest(manifest, outfile, ["vqav2"], 0.25, 9)
-
-    cauldron.update_pool_count(manifest, 123)
-
-    contents = json.loads(manifest.read_text())
-    assert contents["conversation_count"] == 123
-    assert contents["subsets"] == ["vqav2"]
-    assert contents["fraction"] == 0.25
-    assert contents["seed"] == 9
-
-
-def _selected_cauldron_row(conversation_id, image):
-    return {
-        "conversation_id": conversation_id,
-        "conversations": [
-            {
-                "role": "user",
-                "content": [
-                    {"type": "image", "path": f"/images/{image}"},
-                    {"type": "text", "text": "Describe this image"},
-                ],
-            },
-            {"role": "assistant", "content": "A target-model response"},
-        ],
-    }
-
-
-def test_cauldron_selection_groups_duplicate_images_across_subsets():
-    first = _selected_cauldron_row("cauldron/vqav2/7/0", "same.png")
-    second = _selected_cauldron_row("cauldron/okvqa/99/0", "same.png")
-
-    assert cauldron_select.group_id_for(
-        first, "cauldron/vqav2/7"
-    ) == cauldron_select.group_id_for(second, "cauldron/okvqa/99")
-
-
-def test_cauldron_selection_caps_questions_and_balances_subsets(tmp_path):
-    source = tmp_path / "conversations.jsonl"
-    rows = [
-        _selected_cauldron_row("cauldron/vqav2/1/0", "one.png"),
-        _selected_cauldron_row("cauldron/vqav2/1/1", "one.png"),
-        _selected_cauldron_row("cauldron/vqav2/2/0", "two.png"),
-        _selected_cauldron_row("cauldron/vqav2/3/0", "three.png"),
-        _selected_cauldron_row("cauldron/okvqa/1/0", "four.png"),
-        _selected_cauldron_row("cauldron/okvqa/2/0", "five.png"),
-    ]
-    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
-
-    candidate_info, candidates, malformed = cauldron_select.load_candidates(
-        source,
-        {"vqav2", "okvqa"},
-        seed=3,
-        max_questions_per_image=1,
-    )
-
-    assert malformed == 0
-    assert len(candidate_info) == len(rows)
-    assert sum(map(len, candidates.values())) == 5
-    selected = cauldron_select.balanced_take(candidates, 4)
-    counts = {
-        subset: sum(f"/{subset}/" in conversation_id for conversation_id in selected)
-        for subset in ("vqav2", "okvqa")
-    }
-    assert counts == {"vqav2": 2, "okvqa": 2}
-
-
-def test_cauldron_selection_never_splits_one_image_group(tmp_path):
-    source = tmp_path / "conversations.jsonl"
-    rows = [
-        _selected_cauldron_row("cauldron/vqav2/1/0", "shared.png"),
-        _selected_cauldron_row("cauldron/vqav2/1/1", "shared.png"),
-    ]
-    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
-    candidate_info, candidates, _ = cauldron_select.load_candidates(
-        source,
-        {"vqav2"},
-        seed=0,
-        max_questions_per_image=2,
-    )
-
-    train, val = cauldron_select.partition_candidates(
-        candidate_info,
-        candidates,
-        seed=0,
-        val_fraction=0.5,
-    )
-
-    train_ids = {item[1] for values in train.values() for item in values}
-    val_ids = {item[1] for values in val.values() for item in values}
-    assert not (train_ids and val_ids)
-    assert train_ids | val_ids == {row["conversation_id"] for row in rows}
-
-
-def test_cauldron_selection_writes_explicit_disjoint_splits(tmp_path):
-    rows = [
-        _selected_cauldron_row("cauldron/vqav2/1/0", "train.png"),
-        _selected_cauldron_row("cauldron/okvqa/2/0", "val.png"),
-    ]
-    source = tmp_path / "conversations.jsonl"
-    source.write_text("".join(json.dumps(row) + "\n" for row in rows))
-    outfile = tmp_path / "selected.jsonl"
-    candidate_info = {
-        row["conversation_id"]: (
-            row["conversation_id"].split("/")[1],
-            cauldron_select.group_id_for(row, row["conversation_id"].rsplit("/", 1)[0]),
-        )
-        for row in rows
-    }
-
-    cauldron_select.write_selection(
-        source,
-        candidate_info,
-        ["cauldron/vqav2/1/0"],
-        ["cauldron/okvqa/2/0"],
-        outfile,
-    )
-
-    selected = [json.loads(line) for line in outfile.read_text().splitlines()]
-    assert [row["data_split"] for row in selected] == ["train", "val"]
-    assert {row["subset"] for row in selected} == {"vqav2", "okvqa"}
-    assert selected[0]["group_id"] != selected[1]["group_id"]
-
-
-def test_cauldron_sample_cap_estimate_reports_required_increase():
-    message = cauldron.format_sample_cap_error(0.2, 400, 600)
-
-    assert "from 0.2 to an estimated minimum of 0.3" in message
-    assert "+0.1, 50.0% relative" in message
-
-
-def test_cauldron_sample_cap_estimate_reports_when_full_pool_is_too_small():
-    message = cauldron.format_sample_cap_error(0.25, 100, 500)
-
-    assert "PERC_SAMPLES=1" in message
-    assert "400 conversations" in message
-    assert "100% is insufficient" in message
+    assert small == {row for row in ids if export.keeps_row(row, 0.1, 3)}

@@ -1,39 +1,14 @@
 # Multimodal (VLM) data preparation
 
-These scripts build on-policy training data for a vision-language target model:
+Use the [customer training guide](../user_guide/tutorials/train_vlm_dflash.md) for installation, VisionArena and customer request recipes, smoke tests, and resuming runs.
 
-| Script                        | Purpose                                                                       |
-| ----------------------------- | ----------------------------------------------------------------------------- |
-| `export_visionarena.py`       | Turn a local VisionArena-Chat copy into prompt-only conversations plus images |
-| `export_nemotron_vlm.py`      | Same, for Llama-Nemotron-VLM-Dataset-v1, selected by partition and fraction   |
-| `export_cauldron.py`          | Export independently sampled Cauldron questions and materialize their images  |
-| `select_cauldron_data.py`     | Build balanced, image-disjoint Cauldron train and validation selections        |
-| `download_nemotron_images.py` | Fetches images for the Nemotron partitions that ship without them             |
-| `regenerate_vlm_responses.py` | Regenerate assistant responses with the target model, on-policy               |
+| Script                        | Purpose                                                        |
+| ----------------------------- | -------------------------------------------------------------- |
+| `export_visionarena.py`       | Export VisionArena prompts and images from a local cache       |
+| `export_vlm_requests.py`      | Convert JSON/JSONL chat request bodies and base64/local images |
+| `regenerate_vlm_responses.py` | Regenerate assistant turns using the target model              |
 
-The exports emit the same prompt-only conversations, so everything downstream is shared: regeneration, then [`prepare_data.py`](prepare_data.md) like any other conversations JSONL. See `examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh` for VisionArena/Nemotron and `examples/train/dflash_qwen2_5_vl_7b_cauldron_online.sh` for the standalone Cauldron pipeline.
-
-## Mixing VisionArena and Nemotron partitions
-
-`DATASETS` accepts `visionarena` plus individual Nemotron partition names. `DATASET_PROPORTIONS` is positional and must contain exactly one fraction in `(0, 1]` per source:
-
-```bash
-DATASETS=visionarena,vqa_1,vqa_4,vqa_7,vqa_8 \
-DATASET_PROPORTIONS=0.5,0.1,0.9,0.8,0.8 \
-MAX_SAMPLES= \
-CHARTQA_ROOT="/data/ChartQA Dataset" \
-bash examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh
-```
-
-This selects 50% of English VisionArena (unless `EXPORT_LANGUAGE=` is set), 10% of `vqa_1`, 90% of `vqa_4`, and 80% each of `vqa_7` and `vqa_8`. Selection is deterministic from `EXPORT_SEED`. Names and proportions are validated before downloads begin; five datasets with four proportions is an error rather than an implicit default.
-
-`vqa_1` images are fetched automatically at its requested fraction. `vqa_4`, `vqa_7`, and `vqa_8` all reference ChartQA images, which cannot be derived from the row metadata and must be obtained separately. Point `CHARTQA_ROOT` at the extracted ChartQA directory that directly contains `train/png`. The script maps `vqa_4`'s `chartqa/train/...` paths and `vqa_7`/`vqa_8`'s `train/...` paths onto that one tree, then computes a vLLM media allow-root covering both it and the regular output images. The archive is never copied. Set `ALLOWED_MEDIA_PATH` explicitly if the automatically computed common parent is broader than desired.
-
-Leave `MAX_SAMPLES=` empty when proportions should determine the final mixture. A non-empty `MAX_SAMPLES` shuffles and truncates the combined rows after export, so the final ratios are only approximate. To change a mixture in an existing output directory, remove `prompts.jsonl`, `conversations.jsonl`, `prepared/`, `prepared.stamp`, `checkpoints/`, and `mix.stamp`; `images/` can remain and will be reused. Alternatively, choose a new `OUTPUT_DIR`.
-
-If the repositories are not in the same HuggingFace cache, use `VISIONARENA_DATASET_PATH` and `NEMOTRON_DATASET_PATH`. The legacy `DATASET_PATH` is rejected in mixed mode because one path cannot identify both repositories.
-
-Existing Nemotron image downloads can be reused without copying. Set `NEMOTRON_IMAGE_SOURCE` to the **parent** containing partition directories—not to the partition directory itself. For example, if the files are under `/shared/old-run/images/vqa_1_images/`, use `NEMOTRON_IMAGE_SOURCE=/shared/old-run/images`. The downloader skips files already present there, the exporter references them in place, and the script includes that resolved location in vLLM's media allow-root. This reuses `vqa_1`'s OpenImages only; it does not replace the separate `CHARTQA_ROOT` required by `vqa_4`, `vqa_7`, and `vqa_8`.
+Both exporters produce prompt-only conversations consumed by regeneration, followed by `prepare_data.py` and online DFlash training. The VisionArena launcher uses VisionArena exclusively.
 
 ## Why multimodal needs its own path
 
@@ -74,7 +49,7 @@ Output rows are prompt-only, so they are an intermediate artifact: `prepare_data
 **Parameters:**
 
 - `--limit` - target number of conversations to use out of the ~199k. Rows are read as a stream, so a small limit touches only the shards it reaches rather than loading all ~84GB. With `--resume`, existing rows count toward the limit, so rerunning tops the file up instead of appending a second batch.
-- `--fraction` - deterministic fraction of rows to keep after language filtering. It uses the same nested hash-threshold semantics as Nemotron; raising the fraction preserves every previously selected row. It can be combined with `--limit`, which caps the selected rows.
+- `--fraction` - deterministic fraction of rows to keep after language filtering. It uses a nested hash threshold; raising the fraction preserves every previously selected row. It can be combined with `--limit`, which caps the selected rows.
 - `--dataset-path` - directory holding the downloaded dataset: parquet shards (searched recursively) or a `save_to_disk` directory. Defaults to the cached snapshot in the HuggingFace cache (`$HF_HOME`, else `~/.cache/huggingface`). A cache entry holding only `README.md` is rejected rather than treated as an empty dataset.
 - `--allow-download` - stream from the Hub instead, downloading the shards the run reaches. Off by default so a run cannot silently pull tens of GB.
 - `--image-dir` - where image bytes are written. Filenames are content hashes, so reruns and images shared between conversations cost nothing. Pass this directory to vLLM as `--allowed-local-media-path`.
@@ -83,157 +58,16 @@ Output rows are prompt-only, so they are an intermediate artifact: `prepare_data
 - `--require-images` - skip text-only conversations. Off by default, since a VLM drafter also has to predict text-only turns.
 - `--shuffle-buffer-size` - reservoir size for shuffling the stream. Rows hold image bytes, so this trades memory for mixing; shard order is shuffled regardless.
 
-## export_nemotron_vlm.py
+## export_vlm_requests.py
 
-`nvidia/Llama-Nemotron-VLM-Dataset-v1` holds 2.86M single-turn OCR, VQA and captioning rows over documents and charts, split into 21 partitions (`ocr_1`..`ocr_10`, `vqa_1`..`vqa_9`, `captioning_1`..`captioning_2`). Its assistant turns come from other models, so as with VisionArena this script keeps the prompts and images and drops the responses.
-
-Three differences from VisionArena shape the script. Partitions are JSONL files with rows of the form `{"id", "image", "conversations": [{"from": "human"|"gpt", "value"}]}`, where the user turn carries an `<image>` placeholder marking the image's position in the text. Images live in webdataset TAR shards under `<partition>_images/`, keyed by member name, and the `image` field is that member name verbatim — so the tars are read directly and megatron-energon is not needed.
-
-Most importantly, **the repo ships every partition's JSONL but only some partitions' images.** The rest are the entries commented out in `metadataset.yaml`; their images belong to the datasets the rows were annotated from and have to be fetched separately. Check what is usable before choosing:
+Converts customer Chat Completions request bodies from JSON/JSONL into the same prompt format. Base64 and local images are validated, deduplicated, and copied under `--image-dir`. System prompts and per-record generation parameters are preserved. See the [request format and examples](../user_guide/tutorials/train_vlm_dflash.md#customer-request-bodies).
 
 ```bash
-python scripts/export_nemotron_vlm.py --list-partitions
+python scripts/export_vlm_requests.py \
+  --input requests.jsonl \
+  --image-dir ./output/customer/images \
+  --outfile ./output/customer/prompts.jsonl
 ```
-
-A partition without local images is rejected rather than exported, since it would otherwise produce prompts referencing files that do not exist and fail much later, one vLLM request at a time. Five of the imageless partitions draw on OpenImages and can be fetched with [`download_nemotron_images.py`](#download_nemotron_imagespy); the error names them when they apply.
-
-```bash
-python scripts/export_nemotron_vlm.py \
-  --partitions ocr_1,ocr_4,vqa_9 \
-  --fraction 0.1 \
-  --image-dir ./output/nemotron/images \
-  --outfile ./output/nemotron/prompts.jsonl
-```
-
-**Parameters:**
-
-- `--partitions` - comma-separated partitions to export. Default: every partition whose images are present. Order is preserved.
-- `--fraction` - fraction of *each* partition to keep: `1` = 100%, `0.5` = 50%, `0.01` = 1%. This is the size knob, in place of an absolute row count.
-- `--list-partitions` - print every partition with its row count, whether its images are present, and their size, then exit.
-- `--dataset-path` - directory holding the downloaded dataset. Defaults to the cached snapshot in the HuggingFace cache. The dataset itself is never downloaded; unlike VisionArena there is no streaming option, because the images come from TAR shards that have to be on disk.
-- `--image-source` - additional directory to look for `<partition>_images/` in, for images fetched by `download_nemotron_images.py`. It *adds* a location rather than replacing `--dataset-path`, so the shipped TAR shards stay visible alongside downloaded images.
-- `--image-dir` - where images are extracted, one subdirectory per partition. Nested member names are flattened (`data/train/x/1.jpg` becomes `data__train__x__1.jpg`) so that a name from the archive cannot decide where the file lands. Downloaded images are *not* copied here; see below.
-- `--seed` - salts the selection hash. Changing it selects a different subset of the same size, so leave it alone when topping up.
-
-Images that came from TAR shards are extracted under `--image-dir`, but downloaded ones are referenced where they already sit — copying them would be a second copy of a selection that reaches 378 GB for `vqa_1` alone. The export logs every root images are referenced from, and warns if there is more than one, because vLLM accepts a single `--allowed-local-media-path`. Downloading with `--image-source` set to the export's `--image-dir` keeps everything under one root, which is what the training script does.
-
-**The images have to stay on disk for the whole run, including training.** `prepare_data.py` stores a `messages` column holding `file://` URLs rather than pixels, and online hidden-state extraction sends those messages to vLLM, which reads the files at that moment. Deleting the images after preprocessing does not free space early — it breaks training. Budget for them alongside the prepared dataset, not instead of it.
-
-### Why fraction sampling is a hash threshold
-
-Selection compares a digest of each row id against `--fraction` rather than shuffling and slicing. That makes it deterministic without storing any state, and **nested**: every row kept at `0.1` is also kept at `0.2`. Raising the fraction therefore keeps everything already exported and only adds to it, so scaling up reuses the images already extracted. A shuffle-and-slice sample would pick a different subset at the new size and re-extract its images, throwing away the previous run's work.
-
-That property is also what lets the downloader fetch only what will be exported: it calls the same `keeps_row`, so the same `--fraction` and `--seed` name the same subset in both scripts.
-
-## download_nemotron_images.py
-
-Fetches images for the Nemotron partitions that ship without them. Only the five whose images are addressable from the row's `image` field alone can be fetched unattended — `captioning_1`, `captioning_2`, `vqa_1`, `vqa_2`, `vqa_3`, all on OpenImages at `https://s3.amazonaws.com/open-images-dataset/train/{image}`. The others (ChartQA, DocLayNet, PubTables-1M, TextVQA archives) need their source dataset obtained by hand, and are rejected with a pointer to the partition's `.md`.
-
-**The download is sampled with the export.** `vqa_1` is 1,278,221 images and about 378 GB at full size, and a run training on a tenth of it has no use for the other 340 GB. Passing the same `--fraction` and `--seed` as the export fetches exactly the images the export will ask for.
-
-```bash
-# size it first
-python scripts/download_nemotron_images.py \
-  --partitions vqa_1 --fraction 0.05 --dry-run
-
-# fetch, then export the same selection
-python scripts/download_nemotron_images.py \
-  --partitions vqa_1 --fraction 0.05 --image-source ./output/nemotron/images
-python scripts/export_nemotron_vlm.py \
-  --partitions vqa_1 --fraction 0.05 --image-source ./output/nemotron/images \
-  --image-dir ./output/nemotron/images --outfile ./output/nemotron/prompts.jsonl
-```
-
-**Parameters:**
-
-- `--partitions` - comma-separated partitions to fetch images for. Required.
-- `--fraction`, `--seed` - the sampling to fetch for. Must match the export's, or the two disagree about which rows are in play.
-- `--image-source` - directory to create `<partition>_images/` under. Defaults to the dataset directory, which is where the export looks with no extra flags; point it at the export's `--image-dir` to keep one vLLM media root.
-- `--dataset-path` - directory holding the partition JSONLs. Defaults to the HuggingFace cache copy.
-- `--concurrency` - simultaneous requests, default 64. Around 440 images/s (150 MB/s) was measured at that setting and 780 images/s (220 MB/s) at 128, so full `vqa_1` takes roughly half an hour.
-- `--max-retries`, `--timeout` - per-image attempts and per-request timeout.
-- `--dry-run` - report how many images are missing and their approximate size, then exit.
-
-Downloads are resumable: an image already on disk is never refetched, so an interrupted run is continued by rerunning the same command, and raising `--fraction` fetches only the newly selected images. Each file is written under a temporary name and renamed, so an interrupted run cannot leave a truncated image that later looks complete.
-
-Expect a small number of permanent failures. OpenImages has removed keys over the years — about 3.4% of `vqa_1` returns 404 — so the usable row count is a few percent below nominal. These are reported rather than retried, and the export counts the rows it had to drop.
-
-## export_cauldron.py
-
-`HuggingFaceM4/the_cauldron` contains 50 subsets. Each source row may contain multiple images and multiple independent `texts` questions. The exporter writes each question as its own prompt conversation, drops the original assistant answer, and reuses content-addressed image files across those conversations.
-
-```bash
-python scripts/export_cauldron.py \
-  --dataset-path /data/the_cauldron \
-  --subsets chartqa,nlvr2,vqav2 \
-  --fraction 0.25 --seed 0 --resume \
-  --image-dir ./output/cauldron/images \
-  --outfile ./output/cauldron/prompts.jsonl
-```
-
-Local input uses `<subset>/*.parquet`. With no `--dataset-path`, the exporter requires an existing Hugging Face cache snapshot; `--allow-download` explicitly enables Hub streaming. An empty subset selection means all official subsets. `--fraction` is one deterministic nested row fraction for every selected subset.
-
-The pool manifest makes growth append-only: the same subsets and seed may increase the fraction, adding only new stable IDs, but may not decrease it. Use `MAX_SAMPLES` in `dflash_qwen2_5_vl_7b_cauldron_online.sh` to vary the training cap while retaining the larger regenerated pool. The script checks that the pool and successful generations satisfy the cap before preprocessing.
-
-The standalone pipeline then runs `select_cauldron_data.py`. Its default
-`CAULDRON_PROFILE=llava_wild` keeps natural-image, open-ended, OCR, captioning,
-and comparison subsets while excluding the most specialized chart, table,
-medical, and synthetic subsets. `CAULDRON_TRAIN_SUBSETS` overrides that profile,
-and `CAULDRON_PROFILE=all` keeps every exported subset.
-
-Selection addresses two biases in the raw Cauldron pool:
-
-- `MAX_QUESTIONS_PER_IMAGE=1` prevents rows such as VQAv2 from contributing
-  several highly correlated questions about one image.
-- A capped `MAX_SAMPLES` is filled round-robin across available subsets rather
-  than being dominated by the largest subset.
-
-Images are content-addressed, so duplicate images found in different Cauldron
-subsets receive the same `group_id`. The deterministic `VAL_FRACTION=0.1`
-split assigns a complete image group to either train or validation. The
-prepared dataset preserves this explicit split, avoiding the previous leakage
-where sibling questions about one image could cross the index-based 90/10
-boundary.
-
-For a 250K full-vocabulary run aligned with four speculative tokens:
-
-```bash
-PERC_SAMPLES=1.0 \
-MAX_SAMPLES=250000 \
-CAULDRON_PROFILE=llava_wild \
-MAX_QUESTIONS_PER_IMAGE=1 \
-VAL_FRACTION=0.1 \
-BLOCK_SIZE=5 \
-DRAFT_VOCAB_SIZE=152064 \
-EPOCHS=10 \
-CHECKPOINT_FREQ=1 \
-OUTPUT_DIR=/data/dflash_cauldron_llava_wild \
-bash examples/train/dflash_qwen2_5_vl_7b_cauldron_online.sh
-```
-
-The regenerated `conversations.jsonl` remains the reusable superset.
-`selected_conversations.jsonl` and `prepared/` are derived and are rebuilt when
-profile, cap, split, or seed settings change. Keep every numeric epoch
-checkpoint and run the external LLaVA-Wild benchmark against each: lower
-Cauldron validation loss is useful for diagnosing training, but it does not
-guarantee the best out-of-domain speculative acceptance.
-
-### Five-hour Slurm allocations
-
-`slurm/training_script_cauldron.sh` automatically requeues itself ten minutes
-before its five-hour walltime. Its default `CHECKPOINT_FREQ=0.1` overwrites the
-current numeric epoch checkpoint every 10% of the epoch, including
-`training_state.json`; after requeue, training resumes at that batch instead of
-replaying the whole epoch. Export, regeneration, selection, and preparation are
-also restart-safe when `OUTPUT_DIR` is on persistent storage.
-
-The same Slurm job ID is retained and the container log is appended across
-restarts. A normal successful exit or a real pipeline failure is not requeued.
-`SAVE_BEST` must remain empty because it disables fractional checkpoints; the
-Slurm launcher rejects that combination. `checkpoint_best` is still maintained
-at completed validation epochs while numeric checkpoints are retained for
-external benchmarking. A site-level Slurm requeue limit can still stop the job;
-if `scontrol requeue` is denied, the batch log reports that failure explicitly.
 
 ## regenerate_vlm_responses.py
 
@@ -257,7 +91,7 @@ python scripts/regenerate_vlm_responses.py \
 - `--endpoint` - full Chat Completions path, unlike `prepare_data.py`'s `--render-endpoint`, which takes a base URL.
 - `--model` - served model id; auto-detected from `/v1/models` if omitted.
 - `--max-tokens` - cap per generated turn. A response that hits the cap ends regeneration for that conversation rather than conditioning later turns on a cut-off answer.
-- `--sampling-params` - JSON merged into each request. Left empty, vLLM applies the model's own `generation_config` defaults, which is what serving would use and therefore what "on-policy" means here.
+- `--sampling-params` - JSON overrides merged over per-record `generation_params`. If neither specifies a setting, vLLM uses the model's `generation_config` defaults. Per-record `max_tokens` is capped by `--max-tokens`.
 - `--concurrency`, `--max-retries`, `--limit`, `--resume`.
 
 Failed conversations go to a sibling `.errors.jsonl` file rather than the training input, and `--resume` skips conversations already in the output.

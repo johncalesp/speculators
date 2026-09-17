@@ -6,19 +6,16 @@ This page provides a comprehensive reference for all command-line interface (CLI
 
 Speculators provides the following CLI scripts for different stages of the speculative decoding workflow:
 
-| Script                        | Purpose                                                       | Reference                               |
-| ----------------------------- | ------------------------------------------------------------- | --------------------------------------- |
-| `prepare_data.py`             | Preprocess and tokenize datasets for training                 | [→ Details](prepare_data.md)            |
-| `data_generation_offline.py`  | Generate hidden states offline using vLLM                     | [→ Details](data_generation_offline.md) |
-| `launch_vllm.py`              | Launch vLLM server configured for hidden states extraction    | [→ Details](launch_vllm.md)             |
-| `train.py`                    | Train speculator models with online or offline hidden states  | [→ Details](train.md)                   |
-| `response_regeneration/`      | Regenerate dataset responses using a vLLM-served model        | [→ Details](response_regeneration.md)   |
-| `export_visionarena.py`       | Export VisionArena-Chat prompts and images for VLM training   | [→ Details](vlm_data.md)                |
-| `export_nemotron_vlm.py`      | Export Llama-Nemotron-VLM partitions for VLM training         | [→ Details](vlm_data.md)                |
-| `export_cauldron.py`          | Export sampled Cauldron questions and images for VLM training | [→ Details](vlm_data.md)                |
-| `select_cauldron_data.py`     | Balance Cauldron data and create image-disjoint splits         | [→ Details](vlm_data.md)                |
-| `download_nemotron_images.py` | Fetch images for Llama-Nemotron-VLM partitions that lack them | [→ Details](vlm_data.md)                |
-| `regenerate_vlm_responses.py` | Regenerate multimodal responses on-policy with a target VLM   | [→ Details](vlm_data.md)                |
+| Script                        | Purpose                                                      | Reference                               |
+| ----------------------------- | ------------------------------------------------------------ | --------------------------------------- |
+| `prepare_data.py`             | Preprocess and tokenize datasets for training                | [→ Details](prepare_data.md)            |
+| `data_generation_offline.py`  | Generate hidden states offline using vLLM                    | [→ Details](data_generation_offline.md) |
+| `launch_vllm.py`              | Launch vLLM server configured for hidden states extraction   | [→ Details](launch_vllm.md)             |
+| `train.py`                    | Train speculator models with online or offline hidden states | [→ Details](train.md)                   |
+| `response_regeneration/`      | Regenerate dataset responses using a vLLM-served model       | [→ Details](response_regeneration.md)   |
+| `export_vlm_requests.py`      | Convert customer chat requests for VLM training              | [→ Details](vlm_data.md)                |
+| `export_visionarena.py`       | Export VisionArena-Chat prompts and images for VLM training  | [→ Details](vlm_data.md)                |
+| `regenerate_vlm_responses.py` | Regenerate multimodal responses on-policy with a target VLM  | [→ Details](vlm_data.md)                |
 
 ## Common Workflows
 
@@ -31,17 +28,11 @@ flowchart TD
     end
 
     subgraph vlm ["Multimodal (VLM) targets"]
+        VR["export_vlm_requests.py\nConvert customer chat request bodies"]
+        VR --> V2
         V1["export_visionarena.py\nExport prompts & write images to disk"]
-        V3["export_nemotron_vlm.py\nExport partitions & extract images from TAR shards"]
-        V5["export_cauldron.py\nExport independent questions & materialize images"]
-        V6["select_cauldron_data.py\nBalance subsets & assign image-disjoint splits"]
-        V4["download_nemotron_images.py\nFetch images for partitions that ship without them"]
         V2["regenerate_vlm_responses.py\nRegenerate responses on-policy with the target VLM"]
-        V4 -- "images on disk" --> V3
         V1 -- "JSONL prompts + image paths" --> V2
-        V3 -- "JSONL prompts + image paths" --> V2
-        V5 -- "JSONL prompts + image paths" --> V2
-        V2 -- "Cauldron conversations" --> V6
     end
 
     subgraph offline ["Offline Pipeline"]
@@ -61,8 +52,6 @@ flowchart TD
     A -- "JSONL conversations" --> F
     V2 -- "JSONL conversations" --> B
     V2 -- "JSONL conversations" --> F
-    V6 -- "selected Cauldron conversations" --> B
-    V6 -- "selected Cauldron conversations" --> F
     B --> C --> D -- "hs_i.safetensors files\ncontaining {hidden_states}" --> E
     F --> G --> H
 
@@ -74,9 +63,7 @@ flowchart TD
     click E "train/" _self
     click A "response_regeneration/" _self
     click H "train/" _self
+    click VR "vlm_data/" _self
     click V1 "vlm_data/" _self
     click V2 "vlm_data/" _self
-    click V3 "vlm_data/" _self
-    click V5 "vlm_data/" _self
-    click V6 "vlm_data/" _self
 ```
