@@ -1,0 +1,17 @@
+{
+  "VLM_SOURCE": "visionarena",
+  "MODEL": "/hf-cache/hub/models--Qwen--Qwen2.5-VL-7B-Instruct/snapshots/cc594898137f460bfe9f0759e9844b3ce807cfb5",
+  "DATASET_PATH": "/hf-cache/hub/datasets--lmarena-ai--VisionArena-Chat/snapshots/1394b4f59ab6f1f2e5aff6bc15b448e15960e170",
+  "REQUESTS_FILE": "",
+  "EXPORT_LIMIT": "12",
+  "MAX_TURNS": "1",
+  "EXPORT_LANGUAGE": "English",
+  "EXPORT_ALLOW_DOWNLOAD": "",
+  "EXPORT_SEED": "0",
+  "MAX_SAMPLES": "12",
+  "SEQ_LENGTH": "2048",
+  "REGEN_MAX_TOKENS": "128",
+  "REGEN_SAMPLING_PARAMS": "{}",
+  "MM_PROCESSOR_KWARGS": "{\"max_pixels\":200704}",
+  "LIMIT_MM_PER_PROMPT": "{\"image\":4}"
+}

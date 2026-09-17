@@ -1,0 +1,63 @@
+{
+  "image": "vllm/vllm-openai:v0.29.0",
+  "image_digest": "sha256:c2914767605584b6d8f45686b82de173ecc99e781897aa3d0a66dacd72c51ae1",
+  "expected_draft_vocab_size": 152064,
+  "git_sha": "f5dfd20f65ad906b20981d24c58a4c2d2878e18a",
+  "packages": {
+    "speculators": "0.8.0.dev0",
+    "vllm": "0.29.0",
+    "torch": "2.13.0+cu130",
+    "transformers": "5.15.1",
+    "datasets": "5.0.1",
+    "Pillow": "12.3.0",
+    "aiohttp": "3.14.3",
+    "pyarrow": "25.0.1",
+    "hs-connectors": "0.7.1a0"
+  },
+  "runs": {
+    "visionarena": {
+      "exit_code": 0,
+      "exported": 12,
+      "regenerated": 12,
+      "regeneration_errors": 0,
+      "truncated_at_128_tokens": 8,
+      "prepared_rows": 12,
+      "rows_with_images": 12,
+      "supervised_rows": 12,
+      "checkpoint_tensors": 16,
+      "training_state": {
+        "epoch": 0,
+        "local_step": 0,
+        "global_step": 2
+      },
+      "checkpoint": "/workspace/visionarena-smoke-vllm029/checkpoints/0",
+      "draft_vocab_size": 152064,
+      "lm_head_shape": [
+        152064,
+        3584
+      ]
+    },
+    "requests": {
+      "exit_code": 0,
+      "exported": 12,
+      "regenerated": 12,
+      "regeneration_errors": 0,
+      "truncated_at_128_tokens": 0,
+      "prepared_rows": 12,
+      "rows_with_images": 12,
+      "supervised_rows": 12,
+      "checkpoint_tensors": 16,
+      "training_state": {
+        "epoch": 0,
+        "local_step": 0,
+        "global_step": 1
+      },
+      "checkpoint": "/workspace/requests-smoke-vllm029/checkpoints/0",
+      "draft_vocab_size": 152064,
+      "lm_head_shape": [
+        152064,
+        3584
+      ]
+    }
+  }
+}

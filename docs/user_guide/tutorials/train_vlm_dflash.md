@@ -19,12 +19,14 @@ cd speculators
 python3 -m venv .venv
 source .venv/bin/activate
 python -m pip install --upgrade pip
-python -m pip install 'vllm==0.25.1' -e . Pillow aiohttp
+python -m pip install 'vllm==0.29.0' 'transformers==5.15.1' -e . Pillow aiohttp
 ```
 
 The basic Python packages are vLLM for serving/rendering, PyTorch for training, Transformers for model/tokenizer configuration, Datasets/PyArrow for dataset I/O, Hugging Face Hub, Pillow for image validation, and aiohttp/tqdm for regeneration. Installing `-e .` also installs this checkout's `hs-connectors`, used to transfer hidden states. No separate FlashAttention package is required for the DFlash recipe.
 
-An alternative with a prebuilt CUDA/PyTorch stack is `vllm/vllm-openai:v0.25.1`. Install Git **inside the container** as well (`apt-get update && apt-get install -y git`) so `train_command.txt` can capture the source revision. Inside that image, create a virtual environment with `--system-site-packages` and install `-e . Pillow aiohttp`. Launch the container with GPU access, adequate shared memory (the smoke tests use `--shm-size=16g`), and mount the repository, output storage, and Hugging Face cache. Absolute image paths must be visible to both server and trainer.
+An alternative with a prebuilt CUDA/PyTorch stack is `vllm/vllm-openai:v0.29.0`. Install Git **inside the container** as well (`apt-get update && apt-get install -y git`) so `train_command.txt` can capture the source revision. Inside that image, create a virtual environment with `--system-site-packages` and install `'transformers==5.15.1' -e . Pillow aiohttp`. Launch the container with GPU access, adequate shared memory (the smoke tests use `--shm-size=16g`), and mount the repository, output storage, and Hugging Face cache. Absolute image paths must be visible to both server and trainer.
+
+The vLLM `0.29.0` smoke tests use PyTorch `2.13.0+cu130` and Transformers `5.15.1`. The container ships Transformers `5.16.1`; the install command above selects `5.15.1`, which satisfies both vLLM and this repository's dependency constraints. Install into the virtual environment with dependencies enabled.
 
 Separate environments are also supported: set `PYTHON=/path/to/speculators-venv/bin/python` and `VLLM_PYTHON=/path/to/vllm-venv/bin/python`. The serving environment needs vLLM and Transformers; the training environment needs this repository and the packages above. Both processes must share the output directory.
 
@@ -129,7 +131,7 @@ bash examples/train/dflash_qwen2_5_vl_7b_requests_online.sh
 
 Successful runs leave `prepared/state.json`, checkpoint weights/configuration under `checkpoints/0`, and `checkpoints/train_command.txt`. Inspect `conversations.errors.jsonl` and server logs if regeneration fails. The launcher refuses to proceed when requests are missing from regenerated output. A `truncated` flag in conversation metadata means the response reached its token limit; increase `REGEN_MAX_TOKENS` for a real run if needed. Very long records may also be excluded by preprocessing's sequence limit.
 
-See the [recorded H200 validation](../../validation/vlm_dflash_smoke_2026_09_17.md) for the tested source revision, exact environment, and provenance artifacts.
+See the [vLLM 0.29.0 H200 validation](../../validation/vlm_dflash_vllm_0_29_0.md) for the full-vocabulary smoke runs, exact environment, and provenance artifacts. The [earlier vLLM 0.25.1 validation](../../validation/vlm_dflash_smoke_2026_09_17.md) used a 32,000-token draft vocabulary.
 
 ## Configuration and resuming
 
