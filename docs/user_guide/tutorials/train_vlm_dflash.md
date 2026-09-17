@@ -146,11 +146,14 @@ See the [recorded H200 validation](../../validation/vlm_dflash_smoke_2026_09_17.
 | `LIMIT_MM_PER_PROMPT`                    | `{"image":4}`                              | Maximum images in the whole conversation                                      |
 | `TARGET_LAYER_IDS`                       | `2 14 25`                                  | Qwen2.5-VL-7B hidden layers; extraction also includes final layer 28          |
 | `BLOCK_SIZE` / `NUM_LAYERS`              | `16` / `5`                                 | Draft block size and layer count                                              |
-| `MAX_ANCHORS` / `DRAFT_VOCAB_SIZE`       | `3072` / `32000`                           | Training anchors and reduced draft vocabulary                                 |
+| `MAX_ANCHORS`                            | `3072`                                     | Training anchors                                                              |
+| `DRAFT_VOCAB_SIZE`                       | `152064`                                   | Full target vocabulary for Qwen2.5-VL-7B-Instruct; override for your target   |
 | `CHECKPOINT_FREQ` / `SAVE_BEST`          | `1` / empty                                | Epoch checkpoint interval / set nonempty to keep best                         |
 | `NUM_WORKERS`                            | `12`                                       | Training data-loader workers; `0` is useful for debugging                     |
 | `SERVER_PORT` / `SERVER_START_TIMEOUT`   | `8000` / `1800`                            | Local server port / startup timeout in seconds                                |
 | `SERVER_EAGER`                           | empty                                      | Nonempty disables server CUDA graphs for smoke tests                          |
+
+Both launchers explicitly export `DRAFT_VOCAB_SIZE=152064` by default, matching `Qwen/Qwen2.5-VL-7B-Instruct`'s `config.json`. When changing `MODEL`, set `DRAFT_VOCAB_SIZE` to that model's `config.vocab_size` (or `config.text_config.vocab_size` when nested). Use the model configuration value, not the tokenizer's length. For example, prefix the launcher command with `MODEL=/path/to/target DRAFT_VOCAB_SIZE=<target_vocab_size>`. Use a fresh `OUTPUT_DIR` when changing the draft vocabulary size: existing vocabulary mappings and checkpoints from the earlier 32,000-token recipe are incompatible with the new full-vocabulary default.
 
 GPU lists contain physical indices reported by `nvidia-smi`; the launcher sets `CUDA_VISIBLE_DEVICES` separately for each process. Extraction and training lists must be disjoint. Each serving list's length must equal its DP × TP product; `NUM_TRAIN_GPUS` must equal the training list's length. Qwen2.5-VL-7B has 28 attention heads, so use TP 1, 2, or 4 with the default four-GPU allocation.
 

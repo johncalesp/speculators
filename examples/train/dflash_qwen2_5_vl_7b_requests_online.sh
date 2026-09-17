@@ -8,4 +8,7 @@ set -euo pipefail
 : "${REQUESTS_FILE:?Set REQUESTS_FILE to a JSON/JSONL file of chat request bodies}"
 VLM_SOURCE=requests
 OUTPUT_DIR="${OUTPUT_DIR:-./output/dflash_qwen2_5_vl_7b_requests}"
+# Full vocabulary for Qwen/Qwen2.5-VL-7B-Instruct. When changing MODEL,
+# set this to your target's config.vocab_size (or text_config.vocab_size).
+export DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-152064}"
 source "$(dirname "${BASH_SOURCE[0]}")/vlm_dflash_common.sh"

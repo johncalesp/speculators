@@ -8,4 +8,7 @@ if [[ -n "${DATASETS:-}${DATASET_PROPORTIONS:-}" || "${DATASET:-visionarena}" !=
 fi
 VLM_SOURCE=visionarena
 OUTPUT_DIR="${OUTPUT_DIR:-./output/dflash_qwen2_5_vl_7b_visionarena}"
+# Full vocabulary for Qwen/Qwen2.5-VL-7B-Instruct. When changing MODEL,
+# set this to your target's config.vocab_size (or text_config.vocab_size).
+export DRAFT_VOCAB_SIZE="${DRAFT_VOCAB_SIZE:-152064}"
 source "$(dirname "${BASH_SOURCE[0]}")/vlm_dflash_common.sh"
