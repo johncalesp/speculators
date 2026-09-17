@@ -6,6 +6,10 @@ Step-by-step tutorials to guide you through complete workflows, from data prepar
 
 The main end-to-end walkthrough: prepare data, generate hidden states, train, and serve. Covers Eagle-3, P-EAGLE, DFlash, DSpark, and MTP, in online, offline, or hybrid mode -- pick your algorithm and mode at the top of the page.
 
+## [Train a VLM DFlash Drafter](train_vlm_dflash.md)
+
+Train against Qwen2.5-VL using VisionArena or customer chat requests, with installation instructions, base64 image preprocessing, and small end-to-end smoke tests.
+
 ## [Response Regeneration](response_regeneration.md)
 
 Regenerate dataset responses using your target model for improved drafter alignment. Recommended before training.

@@ -1,0 +1,50 @@
+{
+  "git_sha": "cc003cdeaf41b451122a3e4582d7f766b0956fec",
+  "packages": {
+    "speculators": "0.8.0.dev0",
+    "vllm": "0.25.1",
+    "torch": "2.11.0+cu130",
+    "transformers": "5.13.1",
+    "datasets": "5.0.1",
+    "Pillow": "12.3.0",
+    "aiohttp": "3.14.1",
+    "pyarrow": "25.0.1",
+    "hs-connectors": "0.7.1a0"
+  },
+  "runs": {
+    "visionarena": {
+      "exit_code": 0,
+      "exported": 12,
+      "regenerated": 12,
+      "regeneration_errors": 0,
+      "truncated_at_128_tokens": 8,
+      "prepared_rows": 12,
+      "rows_with_images": 12,
+      "supervised_rows": 12,
+      "checkpoint_tensors": 18,
+      "training_state": {
+        "epoch": 0,
+        "local_step": 0,
+        "global_step": 2
+      },
+      "checkpoint": "/workspace/visionarena-smoke-final/checkpoints/0"
+    },
+    "requests": {
+      "exit_code": 0,
+      "exported": 12,
+      "regenerated": 12,
+      "regeneration_errors": 0,
+      "truncated_at_128_tokens": 0,
+      "prepared_rows": 12,
+      "rows_with_images": 12,
+      "supervised_rows": 12,
+      "checkpoint_tensors": 18,
+      "training_state": {
+        "epoch": 0,
+        "local_step": 0,
+        "global_step": 1
+      },
+      "checkpoint": "/workspace/requests-smoke-final/checkpoints/0"
+    }
+  }
+}
