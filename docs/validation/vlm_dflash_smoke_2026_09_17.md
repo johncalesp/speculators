@@ -29,7 +29,7 @@ The environment used Python 3.12 in `vllm/vllm-openai:v0.25.1`, with this reposi
 - VisionArena: [training provenance](vlm_dflash_smoke_2026_09_17/visionarena_train_command.txt), [pipeline configuration](vlm_dflash_smoke_2026_09_17/visionarena_pipeline_config.json).
 - Customer requests: [training provenance](vlm_dflash_smoke_2026_09_17/requests_train_command.txt), [pipeline configuration](vlm_dflash_smoke_2026_09_17/requests_pipeline_config.json).
 
-The launcher artifact uses container paths: `/workspace` mapped to `/home/centml/jcalderon/codex_workspace` on the node. Checkpoints, images, prepared rows, and logs remain there in `visionarena-smoke-final` and `requests-smoke-final`. They are not committed to the repository. Use the [customer guide](../user_guide/tutorials/train_vlm_dflash.md) for portable setup and commands.
+The launcher artifact uses `/workspace` as a generic container mount point for the working directory. Checkpoints, images, prepared rows, and logs remain there in `visionarena-smoke-final` and `requests-smoke-final`. They are not committed to the repository. Use the [customer guide](../user_guide/tutorials/train_vlm_dflash.md) for portable setup and commands.
 
 ## Limits
 

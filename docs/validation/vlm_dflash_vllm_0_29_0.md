@@ -36,7 +36,7 @@ Artifacts:
 - VisionArena: [training provenance](vlm_dflash_vllm_0_29_0/visionarena_train_command.txt), [pipeline configuration](vlm_dflash_vllm_0_29_0/visionarena_pipeline_config.json).
 - Customer requests: [training provenance](vlm_dflash_vllm_0_29_0/requests_train_command.txt), [pipeline configuration](vlm_dflash_vllm_0_29_0/requests_pipeline_config.json).
 
-On the remote node, `/workspace` maps to `/home/centml/jcalderon/codex_workspace`. Checkpoints and datasets remain in `visionarena-smoke-vllm029` and `requests-smoke-vllm029`; model weights are not committed to Git. See the [customer guide](../user_guide/tutorials/train_vlm_dflash.md) for portable setup and usage.
+The working directory is mounted at `/workspace` inside the test container. Checkpoints and datasets remain in `visionarena-smoke-vllm029` and `requests-smoke-vllm029`; model weights are not committed to Git. See the [customer guide](../user_guide/tutorials/train_vlm_dflash.md) for portable setup and usage.
 
 ## Limits
 

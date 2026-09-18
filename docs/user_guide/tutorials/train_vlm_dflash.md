@@ -55,7 +55,7 @@ This launcher no longer accepts Nemotron or mixed datasets. Use a fresh output d
 
 ## Customer request bodies
 
-Use [the valid JSON example](https://github.com/johncalesp/speculators/blob/jcalderon/vlm-experimentation/examples/data/vlm_attribute_request.json). It contains the system instruction, product description, base64 image, temperature, token limit, and token biases from the supplied curl use case. Its image is a synthetic red square for testing, not a product photo. The original `curl_example.txt` is shell documentation, includes an unquoted model substitution and literal line breaks in JSON strings, and its embedded PNG has an invalid checksum. Do not feed that shell text to the converter.
+Start with [examples/data/requests.jsonl](https://github.com/johncalesp/speculators/blob/jcalderon/vlm-experimentation/examples/data/requests.jsonl): three complete request bodies, one per line, with distinct product IDs. Each record includes a system instruction, product description, base64 image, temperature, token limit, and token biases. The [formatted single-request JSON example](https://github.com/johncalesp/speculators/blob/jcalderon/vlm-experimentation/examples/data/vlm_attribute_request.json) shows the same schema with indentation. The examples share a synthetic red square image; replace it with real product images and descriptions for training.
 
 For thousands of records, write **one complete request object per line** in a UTF-8 `.jsonl` file. Use a JSON encoder (`json.dumps`) so newlines inside text are escaped. A `.json` file can instead contain one object or a list of objects. An optional `id` distinguishes otherwise identical records.
 
@@ -80,7 +80,7 @@ Inspect the CPU conversion independently:
 
 ```bash
 python scripts/export_vlm_requests.py \
-  --input requests.jsonl \
+  --input examples/data/requests.jsonl \
   --image-dir ./output/customer_preview/images \
   --outfile ./output/customer_preview/prompts.jsonl
 ```
@@ -90,6 +90,7 @@ The standalone converter accepts multiple files after `--input`. The full launch
 ```bash
 REQUESTS_FILE=/data/requests.jsonl \
 MODEL=Qwen/Qwen2.5-VL-7B-Instruct \
+NUM_LAYERS=5 BLOCK_SIZE=5 DRAFT_VOCAB_SIZE=152064 \
 OUTPUT_DIR=./output/customer_dflash \
 EXPORT_LIMIT=10000 MAX_SAMPLES=10000 EPOCHS=2 \
 bash examples/train/dflash_qwen2_5_vl_7b_requests_online.sh
@@ -135,25 +136,26 @@ See the [vLLM 0.29.0 H200 validation](../../validation/vlm_dflash_vllm_0_29_0.md
 
 ## Configuration and resuming
 
-| Variable                                 | Default                                    | Purpose                                                                       |
-| ---------------------------------------- | ------------------------------------------ | ----------------------------------------------------------------------------- |
-| `MODEL`                                  | `Qwen/Qwen2.5-VL-7B-Instruct`              | Target for generation and hidden states                                       |
-| `OUTPUT_DIR`                             | Dataset-specific directory under `output/` | Images, data, configuration, logs, checkpoints                                |
-| `EXPORT_LIMIT` / `MAX_SAMPLES`           | `5000` / `5000`                            | Export limit / preprocessing conversation cap; empty `MAX_SAMPLES=` keeps all |
-| `SEQ_LENGTH`                             | `8192`                                     | Serving and training sequence limit                                           |
-| `EPOCHS` / `LR`                          | `5` / `3e-4`                               | Training epochs and learning rate                                             |
-| `REGEN_MAX_TOKENS` / `REGEN_CONCURRENCY` | `2048` / `32`                              | Response budget and concurrent conversations                                  |
-| `REGEN_SAMPLING_PARAMS`                  | `{}`                                       | JSON sampling overrides                                                       |
-| `MM_PROCESSOR_KWARGS`                    | `{"max_pixels":1003520}`                   | Shared image processing settings for both servers                             |
-| `LIMIT_MM_PER_PROMPT`                    | `{"image":4}`                              | Maximum images in the whole conversation                                      |
-| `TARGET_LAYER_IDS`                       | `2 14 25`                                  | Qwen2.5-VL-7B hidden layers; extraction also includes final layer 28          |
-| `BLOCK_SIZE` / `NUM_LAYERS`              | `16` / `5`                                 | Draft block size and layer count                                              |
-| `MAX_ANCHORS`                            | `3072`                                     | Training anchors                                                              |
-| `DRAFT_VOCAB_SIZE`                       | `152064`                                   | Full target vocabulary for Qwen2.5-VL-7B-Instruct; override for your target   |
-| `CHECKPOINT_FREQ` / `SAVE_BEST`          | `1` / empty                                | Epoch checkpoint interval / set nonempty to keep best                         |
-| `NUM_WORKERS`                            | `12`                                       | Training data-loader workers; `0` is useful for debugging                     |
-| `SERVER_PORT` / `SERVER_START_TIMEOUT`   | `8000` / `1800`                            | Local server port / startup timeout in seconds                                |
-| `SERVER_EAGER`                           | empty                                      | Nonempty disables server CUDA graphs for smoke tests                          |
+| Variable                                 | Default                                     | Purpose                                                                       |
+| ---------------------------------------- | ------------------------------------------- | ----------------------------------------------------------------------------- |
+| `MODEL`                                  | `Qwen/Qwen2.5-VL-7B-Instruct`               | Target for generation and hidden states                                       |
+| `OUTPUT_DIR`                             | Dataset-specific directory under `output/`  | Images, data, configuration, logs, checkpoints                                |
+| `EXPORT_LIMIT` / `MAX_SAMPLES`           | `5000` / `5000`                             | Export limit / preprocessing conversation cap; empty `MAX_SAMPLES=` keeps all |
+| `SEQ_LENGTH`                             | `8192`                                      | Serving and training sequence limit                                           |
+| `EPOCHS` / `LR`                          | `5` / `3e-4`                                | Training epochs and learning rate                                             |
+| `REGEN_MAX_TOKENS` / `REGEN_CONCURRENCY` | `2048` / `32`                               | Response budget and concurrent conversations                                  |
+| `REGEN_SAMPLING_PARAMS`                  | `{}`                                        | JSON sampling overrides                                                       |
+| `MM_PROCESSOR_KWARGS`                    | `{"max_pixels":1003520}`                    | Shared image processing settings for both servers                             |
+| `LIMIT_MM_PER_PROMPT`                    | `{"image":4}`                               | Maximum images in the whole conversation                                      |
+| `TARGET_LAYER_IDS`                       | `2 14 25`                                   | Qwen2.5-VL-7B hidden layers; extraction also includes final layer 28          |
+| `BLOCK_SIZE`                             | `5` (customer requests), `16` (VisionArena) | Draft block size                                                              |
+| `NUM_LAYERS`                             | `5`                                         | Draft layer count                                                             |
+| `MAX_ANCHORS`                            | `3072`                                      | Training anchors                                                              |
+| `DRAFT_VOCAB_SIZE`                       | `152064`                                    | Full target vocabulary for Qwen2.5-VL-7B-Instruct; override for your target   |
+| `CHECKPOINT_FREQ` / `SAVE_BEST`          | `1` / empty                                 | Epoch checkpoint interval / set nonempty to keep best                         |
+| `NUM_WORKERS`                            | `12`                                        | Training data-loader workers; `0` is useful for debugging                     |
+| `SERVER_PORT` / `SERVER_START_TIMEOUT`   | `8000` / `1800`                             | Local server port / startup timeout in seconds                                |
+| `SERVER_EAGER`                           | empty                                       | Nonempty disables server CUDA graphs for smoke tests                          |
 
 Both launchers explicitly export `DRAFT_VOCAB_SIZE=152064` by default, matching `Qwen/Qwen2.5-VL-7B-Instruct`'s `config.json`. When changing `MODEL`, set `DRAFT_VOCAB_SIZE` to that model's `config.vocab_size` (or `config.text_config.vocab_size` when nested). Use the model configuration value, not the tokenizer's length. For example, prefix the launcher command with `MODEL=/path/to/target DRAFT_VOCAB_SIZE=<target_vocab_size>`. Use a fresh `OUTPUT_DIR` when changing the draft vocabulary size: existing vocabulary mappings and checkpoints from the earlier 32,000-token recipe are incompatible with the new full-vocabulary default.
 
