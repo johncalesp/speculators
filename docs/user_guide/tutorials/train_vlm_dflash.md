@@ -51,8 +51,6 @@ EXPORT_LIMIT=50000 MAX_SAMPLES=50000 EPOCHS=2 \
 bash examples/train/dflash_qwen2_5_vl_7b_visionarena_online.sh
 ```
 
-This launcher no longer accepts Nemotron or mixed datasets. Use a fresh output directory when moving from an earlier mixed run.
-
 ## Customer request bodies
 
 Start with [examples/data/requests.jsonl](https://github.com/johncalesp/speculators/blob/jcalderon/vlm-experimentation/examples/data/requests.jsonl): three complete request bodies, one per line, with distinct product IDs. Each record includes a system instruction, product description, base64 image, temperature, token limit, and token biases. The [formatted single-request JSON example](https://github.com/johncalesp/speculators/blob/jcalderon/vlm-experimentation/examples/data/vlm_attribute_request.json) shows the same schema with indentation. The examples share a synthetic red square image; replace it with real product images and descriptions for training.
